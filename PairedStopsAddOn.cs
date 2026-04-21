@@ -411,33 +411,61 @@ namespace NinjaTrader.NinjaScript.AddOns.PairedStops
 
         public void Show(string instrumentName, double buyPx, double sellPx)
         {
-            Hide(); // defensive — clears any stale lines
+            Hide();
+
+            Output.Process($"[PairedStops] Ghost.Show start: inst={instrumentName} buy={buyPx} sell={sellPx}", PrintTo.OutputTab1);
 
             _chart = FindChart(instrumentName);
-            if (_chart == null) return; // silent — panel confirmation carries the UX
+            if (_chart == null)
+            {
+                Output.Process("[PairedStops] Ghost.Show: no ChartControl found for instrument", PrintTo.OutputTab1);
+                return;
+            }
+            Output.Process($"[PairedStops] Ghost.Show: chart found type={_chart.GetType().Name}", PrintTo.OutputTab1);
 
             try
             {
                 _chart.Dispatcher.Invoke(() =>
                 {
-                    _overlay = FindVisualChildren<Canvas>(_chart).FirstOrDefault();
-                    if (_overlay == null) return;
+                    // Prefer the actual price-plotting ChartPanel; fall back to first Canvas.
+                    var canvases = FindVisualChildren<Canvas>(_chart).ToList();
+                    _overlay = canvases.FirstOrDefault(c => c.GetType().Name == "ChartPanel")
+                             ?? canvases.FirstOrDefault();
 
-                    var buyBrush  = (System.Windows.Media.SolidColorBrush)new System.Windows.Media.BrushConverter()
-                                       .ConvertFromString(_settings.PreviewBuyColorArgb);
-                    var sellBrush = (System.Windows.Media.SolidColorBrush)new System.Windows.Media.BrushConverter()
-                                       .ConvertFromString(_settings.PreviewSellColorArgb);
+                    if (_overlay == null)
+                    {
+                        Output.Process("[PairedStops] Ghost.Show: no Canvas found in chart visual tree", PrintTo.OutputTab1);
+                        return;
+                    }
+                    Output.Process($"[PairedStops] Ghost.Show: overlay={_overlay.GetType().Name} w={_overlay.ActualWidth:F1} h={_overlay.ActualHeight:F1}", PrintTo.OutputTab1);
+
+                    var buyBrush  = ParseBrush(_settings.PreviewBuyColorArgb,  System.Windows.Media.Brushes.LimeGreen);
+                    var sellBrush = ParseBrush(_settings.PreviewSellColorArgb, System.Windows.Media.Brushes.Red);
 
                     _buyLine  = BuildLine(buyPx,  buyBrush);
                     _sellLine = BuildLine(sellPx, sellBrush);
-                    if (_buyLine  != null) _overlay.Children.Add(_buyLine);
-                    if (_sellLine != null) _overlay.Children.Add(_sellLine);
+
+                    if (_buyLine  == null || _sellLine == null)
+                    {
+                        Output.Process($"[PairedStops] Ghost.Show: line build failed (buy={_buyLine!=null} sell={_sellLine!=null})", PrintTo.OutputTab1);
+                        return;
+                    }
+
+                    _overlay.Children.Add(_buyLine);
+                    _overlay.Children.Add(_sellLine);
+                    Output.Process($"[PairedStops] Ghost.Show: lines added (children count now {_overlay.Children.Count})", PrintTo.OutputTab1);
                 });
             }
             catch (Exception ex)
             {
-                Output.Process($"[PairedStops] Ghost preview render failed: {ex.Message}", PrintTo.OutputTab1);
+                Output.Process($"[PairedStops] Ghost.Show render failed: {ex}", PrintTo.OutputTab1);
             }
+        }
+
+        private static System.Windows.Media.Brush ParseBrush(string argb, System.Windows.Media.Brush fallback)
+        {
+            try { return (System.Windows.Media.Brush)new System.Windows.Media.BrushConverter().ConvertFromString(argb); }
+            catch { return fallback; }
         }
 
         public void Hide()
@@ -479,24 +507,90 @@ namespace NinjaTrader.NinjaScript.AddOns.PairedStops
 
         private double? YForPrice(double price)
         {
+            // Primary path: ChartControl.ChartPanels[0].ChartScales[0].GetYByValue(price)
+            var y = TryViaChartPanels(price);
+            if (y != null) return y;
+
+            // Fallback: ChartControl.ChartScale.GetYByValue(price)
+            y = TryViaDirectScale(price);
+            if (y != null) return y;
+
+            Output.Process("[PairedStops] Ghost YForPrice: all reflection paths failed — chart-overlay drawing not supported on this NT8 build.", PrintTo.OutputTab1);
+            return null;
+        }
+
+        private double? TryViaChartPanels(double price)
+        {
             try
             {
-                // ChartScale is the price-to-pixel mapping on the chart's active panel.
-                // Accessed via ChartPanel.ChartScale in most NT8 builds.
-                var chartScaleProp = _chart.GetType().GetProperty("ChartScale");
-                var chartScale     = chartScaleProp?.GetValue(_chart);
-                if (chartScale == null) return null;
+                var panelsObj = _chart.GetType().GetProperty("ChartPanels")?.GetValue(_chart);
+                if (panelsObj == null)
+                {
+                    Output.Process("[PairedStops] Ghost: ChartControl has no ChartPanels property", PrintTo.OutputTab1);
+                    return null;
+                }
 
-                var getY = chartScale.GetType().GetMethod("GetYByValue", new[] { typeof(double) });
-                if (getY == null) return null;
+                var firstPanel = EnumerateFirst(panelsObj);
+                if (firstPanel == null) { Output.Process("[PairedStops] Ghost: ChartPanels empty", PrintTo.OutputTab1); return null; }
 
-                var y = getY.Invoke(chartScale, new object[] { price });
-                return y is float f ? (double?)f : y is double d ? (double?)d : null;
+                var scalesObj = firstPanel.GetType().GetProperty("ChartScales")?.GetValue(firstPanel);
+                if (scalesObj == null)
+                {
+                    Output.Process($"[PairedStops] Ghost: {firstPanel.GetType().Name} has no ChartScales property", PrintTo.OutputTab1);
+                    return null;
+                }
+
+                var firstScale = EnumerateFirst(scalesObj);
+                if (firstScale == null) { Output.Process("[PairedStops] Ghost: ChartScales empty", PrintTo.OutputTab1); return null; }
+
+                var getY = firstScale.GetType().GetMethod("GetYByValue", new[] { typeof(double) });
+                if (getY == null) { Output.Process($"[PairedStops] Ghost: {firstScale.GetType().Name}.GetYByValue not found", PrintTo.OutputTab1); return null; }
+
+                var result = getY.Invoke(firstScale, new object[] { price });
+                var y = ConvertNumber(result);
+                Output.Process($"[PairedStops] Ghost: y via ChartPanels path = {y} for price {price}", PrintTo.OutputTab1);
+                return y;
             }
-            catch
+            catch (Exception ex)
             {
+                Output.Process($"[PairedStops] Ghost TryViaChartPanels ex: {ex.Message}", PrintTo.OutputTab1);
                 return null;
             }
+        }
+
+        private double? TryViaDirectScale(double price)
+        {
+            try
+            {
+                var scale = _chart.GetType().GetProperty("ChartScale")?.GetValue(_chart);
+                if (scale == null) return null;
+                var getY = scale.GetType().GetMethod("GetYByValue", new[] { typeof(double) });
+                if (getY == null) return null;
+                var y = ConvertNumber(getY.Invoke(scale, new object[] { price }));
+                Output.Process($"[PairedStops] Ghost: y via direct scale = {y} for price {price}", PrintTo.OutputTab1);
+                return y;
+            }
+            catch (Exception ex)
+            {
+                Output.Process($"[PairedStops] Ghost TryViaDirectScale ex: {ex.Message}", PrintTo.OutputTab1);
+                return null;
+            }
+        }
+
+        private static object EnumerateFirst(object collection)
+        {
+            if (collection is System.Collections.IEnumerable e)
+                foreach (var item in e) return item;
+            return null;
+        }
+
+        private static double? ConvertNumber(object v)
+        {
+            if (v == null) return null;
+            if (v is double d) return d;
+            if (v is float f)  return (double)f;
+            if (v is int i)    return (double)i;
+            return null;
         }
 
         private static NinjaTrader.Gui.Chart.ChartControl FindChart(string instrumentName)
