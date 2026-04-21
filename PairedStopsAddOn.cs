@@ -52,8 +52,6 @@ namespace NinjaTrader.NinjaScript.AddOns.PairedStops
         public string PreviewDashStyle     { get; set; } = "Dashed";
 
         public string PairTagPrefix { get; set; } = "PAIRSTOP_";
-
-        public bool AudibleDragSync { get; set; } = false;
     }
 
     public static class SettingsStore
@@ -113,8 +111,7 @@ namespace NinjaTrader.NinjaScript.AddOns.PairedStops
             AppendStr(sb, "PreviewSellColorArgb", s.PreviewSellColorArgb, isLast: false);
             AppendNum(sb, "PreviewLineWidth", s.PreviewLineWidth, isLast: false);
             AppendStr(sb, "PreviewDashStyle", s.PreviewDashStyle, isLast: false);
-            AppendStr(sb, "PairTagPrefix", s.PairTagPrefix, isLast: false);
-            AppendBool(sb, "AudibleDragSync", s.AudibleDragSync, isLast: true);
+            AppendStr(sb, "PairTagPrefix", s.PairTagPrefix, isLast: true);
             sb.Append("}\n");
             return sb.ToString();
         }
@@ -138,7 +135,6 @@ namespace NinjaTrader.NinjaScript.AddOns.PairedStops
                     case "PreviewLineWidth":    if (double.TryParse(v, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var w)) s.PreviewLineWidth = w; break;
                     case "PreviewDashStyle":    s.PreviewDashStyle = Unquote(v); break;
                     case "PairTagPrefix":       s.PairTagPrefix = Unquote(v); break;
-                    case "AudibleDragSync":     s.AudibleDragSync = (v == "true"); break;
                 }
             }
             return s;
@@ -754,10 +750,6 @@ namespace NinjaTrader.NinjaScript.AddOns.PairedStops
                         }
                     }
 
-                    if (_settings.AudibleDragSync)
-                    {
-                        try { System.Media.SystemSounds.Asterisk.Play(); } catch { /* no audio device — ignore */ }
-                    }
                     _view.SetStatus($"Synced partner to {expectedPartnerPx}.");
                 }
                 catch (Exception ex)
@@ -1122,7 +1114,6 @@ namespace NinjaTrader.NinjaScript.AddOns.PairedStops
         public TextBox  QuantityBox    { get; }
         public TextBox  AtmTemplateBox { get; }
         public CheckBox GhostToggle    { get; }
-        public CheckBox AudibleToggle  { get; }
 
         public Button PlaceButton  { get; }
         public Button CancelButton { get; }
@@ -1151,7 +1142,7 @@ namespace NinjaTrader.NinjaScript.AddOns.PairedStops
             var inputs = new Grid();
             inputs.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
             inputs.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(220) });
-            for (int i = 0; i < 7; i++)
+            for (int i = 0; i < 6; i++)
                 inputs.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
 
             int row = 0;
@@ -1161,7 +1152,6 @@ namespace NinjaTrader.NinjaScript.AddOns.PairedStops
             QuantityBox    = AddRow(inputs, ref row, "Quantity",          new TextBox  { Text = settings.Quantity.ToString(System.Globalization.CultureInfo.InvariantCulture), Foreground = TextBrush });
             AtmTemplateBox = AddRow(inputs, ref row, "ATM template",      new TextBox  { Text = settings.AtmTemplate, Foreground = TextBrush });
             GhostToggle    = AddRow(inputs, ref row, "Ghost preview",     new CheckBox { IsChecked = settings.GhostPreviewEnabled, Foreground = TextBrush });
-            AudibleToggle  = AddRow(inputs, ref row, "Beep on drag-sync", new CheckBox { IsChecked = settings.AudibleDragSync,     Foreground = TextBrush });
 
             Grid.SetRow(inputs, 0);
             root.Children.Add(inputs);
@@ -1272,8 +1262,6 @@ namespace NinjaTrader.NinjaScript.AddOns.PairedStops
             };
             GhostToggle.Checked   += (s, e) => { Settings.GhostPreviewEnabled = true;  SettingsStore.Save(Settings); };
             GhostToggle.Unchecked += (s, e) => { Settings.GhostPreviewEnabled = false; SettingsStore.Save(Settings); };
-            AudibleToggle.Checked   += (s, e) => { Settings.AudibleDragSync = true;  SettingsStore.Save(Settings); };
-            AudibleToggle.Unchecked += (s, e) => { Settings.AudibleDragSync = false; SettingsStore.Save(Settings); };
         }
 
         private static T AddRow<T>(Grid grid, ref int row, string label, T control) where T : FrameworkElement
