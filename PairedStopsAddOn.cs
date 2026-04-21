@@ -264,20 +264,201 @@ namespace NinjaTrader.NinjaScript.AddOns.PairedStops
 
     public class PairedStopsTab : NTTabPage
     {
+        private readonly PairedStopsSettings _settings;
+        private readonly PairedStopsView     _view;
+
         public PairedStopsTab()
         {
-            // Placeholder — replaced by PairedStopsView in Task 4.
-            Content = new TextBlock
-            {
-                Text     = "Paired Stops — coming soon",
-                Margin   = new Thickness(16),
-                FontSize = 14
-            };
+            _settings = SettingsStore.Load();
+            _view     = new PairedStopsView(_settings);
+            Content   = _view;
         }
 
-        public override void Cleanup() { }
+        public override void Cleanup()
+        {
+            SettingsStore.Save(_settings);
+        }
+
         protected override string GetHeaderSubText() => "Paired Stops";
         protected override void RestoreFromXElement(XElement element) { }
         protected override void SaveToXElement(XElement element) { }
+    }
+
+    // -------------------------------------------------------------------------
+    // The view (WPF UserControl, all code-behind)
+    // -------------------------------------------------------------------------
+    public class PairedStopsView : UserControl
+    {
+        public PairedStopsSettings Settings { get; }
+
+        public ComboBox AccountCombo  { get; }
+        public TextBox  InstrumentBox { get; }
+        public TextBox  OffsetBox     { get; }
+        public TextBox  QuantityBox   { get; }
+        public CheckBox GhostToggle   { get; }
+        public CheckBox AudibleToggle { get; }
+
+        public Button PlaceButton  { get; }
+        public Button CancelButton { get; }
+
+        public StackPanel PreviewStrip         { get; }
+        public TextBlock  PreviewText          { get; }
+        public Button     PreviewConfirmButton { get; }
+        public Button     PreviewCancelButton  { get; }
+
+        public TextBlock StatusText { get; }
+
+        public PairedStopsView(PairedStopsSettings settings)
+        {
+            Settings    = settings;
+            DataContext = settings;
+
+            // Root grid — 5 rows: inputs, buttons, preview strip, spacer, status.
+            var root = new Grid { Margin = new Thickness(12) };
+            root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+            root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+            root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+            root.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
+            root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+
+            // --- Inputs ---
+            var inputs = new Grid();
+            inputs.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+            inputs.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(220) });
+            for (int i = 0; i < 6; i++)
+                inputs.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+
+            int row = 0;
+            AccountCombo  = AddRow(inputs, ref row, "Account",           new ComboBox());
+            InstrumentBox = AddRow(inputs, ref row, "Instrument",        new TextBox { Text = settings.InstrumentName });
+            OffsetBox     = AddRow(inputs, ref row, "Offset (pts)",      new TextBox { Text = settings.OffsetPoints.ToString("0.##", System.Globalization.CultureInfo.InvariantCulture) });
+            QuantityBox   = AddRow(inputs, ref row, "Quantity",          new TextBox { Text = settings.Quantity.ToString(System.Globalization.CultureInfo.InvariantCulture) });
+            GhostToggle   = AddRow(inputs, ref row, "Ghost preview",     new CheckBox { IsChecked = settings.GhostPreviewEnabled });
+            AudibleToggle = AddRow(inputs, ref row, "Beep on drag-sync", new CheckBox { IsChecked = settings.AudibleDragSync });
+
+            Grid.SetRow(inputs, 0);
+            root.Children.Add(inputs);
+
+            // --- Buttons ---
+            var buttons = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 12, 0, 0) };
+            PlaceButton  = new Button { Content = "Place Paired Stops", Padding = new Thickness(12, 6, 12, 6), Margin = new Thickness(0, 0, 8, 0) };
+            CancelButton = new Button { Content = "Cancel Pair",        Padding = new Thickness(12, 6, 12, 6) };
+            buttons.Children.Add(PlaceButton);
+            buttons.Children.Add(CancelButton);
+            Grid.SetRow(buttons, 1);
+            root.Children.Add(buttons);
+
+            // --- Preview strip (hidden until ghost preview is triggered) ---
+            PreviewStrip = new StackPanel
+            {
+                Orientation = Orientation.Horizontal,
+                Margin      = new Thickness(0, 12, 0, 0),
+                Visibility  = Visibility.Collapsed
+            };
+            PreviewText          = new TextBlock { VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(0, 0, 12, 0) };
+            PreviewConfirmButton = new Button { Content = "Confirm", Padding = new Thickness(8, 4, 8, 4), Margin = new Thickness(0, 0, 4, 0) };
+            PreviewCancelButton  = new Button { Content = "Cancel",  Padding = new Thickness(8, 4, 8, 4) };
+            PreviewStrip.Children.Add(PreviewText);
+            PreviewStrip.Children.Add(PreviewConfirmButton);
+            PreviewStrip.Children.Add(PreviewCancelButton);
+            Grid.SetRow(PreviewStrip, 2);
+            root.Children.Add(PreviewStrip);
+
+            // --- Status ---
+            StatusText = new TextBlock
+            {
+                Margin       = new Thickness(0, 12, 0, 0),
+                TextWrapping = TextWrapping.Wrap,
+                Foreground   = System.Windows.Media.Brushes.DimGray
+            };
+            Grid.SetRow(StatusText, 4);
+            root.Children.Add(StatusText);
+
+            Content = root;
+
+            PopulateAccounts();
+            HookPersistence();
+        }
+
+        public void SetStatus(string message, bool isError = false)
+        {
+            Dispatcher.BeginInvoke(new Action(() =>
+            {
+                StatusText.Text       = message;
+                StatusText.Foreground = isError
+                    ? System.Windows.Media.Brushes.Red
+                    : System.Windows.Media.Brushes.DimGray;
+            }));
+        }
+
+        private void PopulateAccounts()
+        {
+            try
+            {
+                foreach (var acct in Account.All)
+                    AccountCombo.Items.Add(acct.Name);
+            }
+            catch (Exception ex)
+            {
+                Output.Process($"[PairedStops] Failed to enumerate accounts: {ex.Message}", PrintTo.OutputTab1);
+            }
+
+            if (!string.IsNullOrEmpty(Settings.AccountName) && AccountCombo.Items.Contains(Settings.AccountName))
+                AccountCombo.SelectedItem = Settings.AccountName;
+            else if (AccountCombo.Items.Count > 0)
+                AccountCombo.SelectedIndex = 0;
+        }
+
+        private void HookPersistence()
+        {
+            AccountCombo.SelectionChanged += (s, e) =>
+            {
+                Settings.AccountName = AccountCombo.SelectedItem as string ?? "";
+                SettingsStore.Save(Settings);
+            };
+            InstrumentBox.LostFocus += (s, e) =>
+            {
+                Settings.InstrumentName = InstrumentBox.Text.Trim();
+                SettingsStore.Save(Settings);
+            };
+            OffsetBox.LostFocus += (s, e) =>
+            {
+                if (double.TryParse(OffsetBox.Text, System.Globalization.NumberStyles.Float,
+                                    System.Globalization.CultureInfo.InvariantCulture, out var v) && v > 0)
+                {
+                    Settings.OffsetPoints = v;
+                    SettingsStore.Save(Settings);
+                }
+            };
+            QuantityBox.LostFocus += (s, e) =>
+            {
+                if (int.TryParse(QuantityBox.Text, out var v) && v > 0)
+                {
+                    Settings.Quantity = v;
+                    SettingsStore.Save(Settings);
+                }
+            };
+            GhostToggle.Checked   += (s, e) => { Settings.GhostPreviewEnabled = true;  SettingsStore.Save(Settings); };
+            GhostToggle.Unchecked += (s, e) => { Settings.GhostPreviewEnabled = false; SettingsStore.Save(Settings); };
+            AudibleToggle.Checked   += (s, e) => { Settings.AudibleDragSync = true;  SettingsStore.Save(Settings); };
+            AudibleToggle.Unchecked += (s, e) => { Settings.AudibleDragSync = false; SettingsStore.Save(Settings); };
+        }
+
+        private static T AddRow<T>(Grid grid, ref int row, string label, T control) where T : FrameworkElement
+        {
+            var lbl = new TextBlock
+            {
+                Text              = label,
+                Margin            = new Thickness(0, 4, 12, 4),
+                VerticalAlignment = VerticalAlignment.Center
+            };
+            Grid.SetRow(lbl,     row); Grid.SetColumn(lbl,     0);
+            Grid.SetRow(control, row); Grid.SetColumn(control, 1);
+            control.Margin = new Thickness(0, 4, 0, 4);
+            grid.Children.Add(lbl);
+            grid.Children.Add(control);
+            row++;
+            return control;
+        }
     }
 }
