@@ -20,7 +20,6 @@ using System.Linq;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Threading;
-using System.Xml.Linq;
 using NinjaTrader.Cbi;
 using NinjaTrader.Code;
 using NinjaTrader.Core;
@@ -230,12 +229,12 @@ namespace NinjaTrader.NinjaScript.AddOns.PairedStops
 
         protected override void OnWindowCreated(Window window)
         {
-            // Only inject into NT's Control Center window.
-            if (!(window is NinjaTrader.Gui.Tools.ControlCenter cc)) return;
+            // The Control Center is the main NT window; detect by type name rather
+            // than by type import to stay independent of internal namespace moves.
+            if (window == null || window.GetType().Name != "ControlCenter") return;
 
             _ownerWindow = window;
-            var newMenu = cc.MainMenu?.OfType<NTMenuItem>().FirstOrDefault(m =>
-                (m.Header?.ToString() ?? "") == "New");
+            var newMenu = FindNewMenu(window);
             if (newMenu == null) return;
 
             _menuItem = new NTMenuItem
@@ -253,64 +252,59 @@ namespace NinjaTrader.NinjaScript.AddOns.PairedStops
             if (_menuItem != null)
             {
                 _menuItem.Click -= OnMenuClick;
-                if (window is NinjaTrader.Gui.Tools.ControlCenter cc)
-                {
-                    var newMenu = cc.MainMenu?.OfType<NTMenuItem>().FirstOrDefault(m =>
-                        (m.Header?.ToString() ?? "") == "New");
-                    newMenu?.Items.Remove(_menuItem);
-                }
+                var newMenu = FindNewMenu(window);
+                newMenu?.Items.Remove(_menuItem);
                 _menuItem = null;
             }
             _ownerWindow = null;
         }
 
-        private static void OnMenuClick(object sender, RoutedEventArgs e)
+        private static MenuItem FindNewMenu(Window window)
         {
-            var factory = new PairedStopsTabFactory();
-            var parent  = factory.CreateParentWindow();
-            var tab     = factory.CreateTabContent() as NTTabPage;
-            if (parent is NTWindow w && tab != null)
+            foreach (var menu in FindVisualChildren<Menu>(window))
             {
-                w.MainTabControl.AddNTTabPage(tab);
-                w.Show();
+                var candidate = menu.Items.OfType<MenuItem>().FirstOrDefault(m =>
+                    (m.Header?.ToString() ?? "") == "New");
+                if (candidate != null) return candidate;
+            }
+            return null;
+        }
+
+        private static IEnumerable<T> FindVisualChildren<T>(DependencyObject parent) where T : DependencyObject
+        {
+            if (parent == null) yield break;
+            int count = System.Windows.Media.VisualTreeHelper.GetChildrenCount(parent);
+            for (int i = 0; i < count; i++)
+            {
+                var child = System.Windows.Media.VisualTreeHelper.GetChild(parent, i);
+                if (child is T hit) yield return hit;
+                foreach (var nested in FindVisualChildren<T>(child)) yield return nested;
             }
         }
-    }
 
-    // -------------------------------------------------------------------------
-    // Tab factory + tab page
-    // -------------------------------------------------------------------------
-    public class PairedStopsTabFactory : INTTabFactory
-    {
-        public NTWindow CreateParentWindow() =>
-            new NTWindow { Caption = "Paired Stops", Width = 420, Height = 380 };
-
-        public NTTabPage CreateTabContent() => new PairedStopsTab();
-    }
-
-    public class PairedStopsTab : NTTabPage
-    {
-        private readonly PairedStopsSettings _settings;
-        private readonly PairedStopsView     _view;
-        private readonly PairManager         _manager;
-
-        public PairedStopsTab()
+        private static void OnMenuClick(object sender, RoutedEventArgs e)
         {
-            _settings = SettingsStore.Load();
-            _view     = new PairedStopsView(_settings);
-            _manager  = new PairManager(_view, _settings);
-            Content   = _view;
-        }
+            // Open a plain NTWindow hosting the view directly — simpler and
+            // more portable than registering an NTTabPage/INTTabFactory, whose
+            // abstract member shapes vary across NT8 builds.
+            var settings = SettingsStore.Load();
+            var view     = new PairedStopsView(settings);
+            var manager  = new PairManager(view, settings);
 
-        public override void Cleanup()
-        {
-            _manager.Dispose();
-            SettingsStore.Save(_settings);
+            var window = new NTWindow
+            {
+                Caption = "Paired Stops",
+                Content = view,
+                Width   = 440,
+                Height  = 400
+            };
+            window.Closed += (s, args) =>
+            {
+                manager.Dispose();
+                SettingsStore.Save(settings);
+            };
+            window.Show();
         }
-
-        protected override string GetHeaderSubText() => "Paired Stops";
-        protected override void RestoreFromXElement(XElement element) { }
-        protected override void SaveToXElement(XElement element) { }
     }
 
     // -------------------------------------------------------------------------
@@ -616,7 +610,9 @@ namespace NinjaTrader.NinjaScript.AddOns.PairedStops
                 {
                     lock (_sync) { _programmatic = true; acquired = true; }
 
-                    _subscribedAccount.ChangeOrder(new[] { partner }, partner.Quantity, 0, expectedPartnerPx);
+                    // NT8 unmanaged-order modification: mutate price via Order.Update,
+                    // which propagates the change to the broker internally.
+                    partner.Update(partner.Quantity, 0, expectedPartnerPx);
 
                     if (_settings.AudibleDragSync)
                     {
@@ -675,7 +671,7 @@ namespace NinjaTrader.NinjaScript.AddOns.PairedStops
 
                 bool isReject = e.Order.OrderState == OrderState.Rejected;
                 string msg    = isReject
-                    ? $"Order rejected: {e.Order.ErrorCode} {e.Order.NativeError}"
+                    ? $"Order rejected: {e.Order.Error}"
                     : "One leg cancelled — partner cancelled to preserve pair integrity.";
                 _view.SetStatus(msg, isError: isReject);
                 return;
