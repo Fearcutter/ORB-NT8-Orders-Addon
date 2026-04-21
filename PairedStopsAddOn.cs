@@ -314,6 +314,157 @@ namespace NinjaTrader.NinjaScript.AddOns.PairedStops
     }
 
     // -------------------------------------------------------------------------
+    // GhostPreview — optional chart-overlay lines for the Confirm/Cancel step
+    // -------------------------------------------------------------------------
+    //
+    // Draws two dashed horizontal lines on a chart showing the instrument, at
+    // the proposed buy / sell stop prices. Uses plain WPF Line shapes over the
+    // chart's visual tree rather than NT's Draw.HorizontalLine API — the
+    // Draw.* methods require a NinjaScriptBase context that AddOns don't have,
+    // and reflecting one out is more fragile than just overlaying Lines.
+    //
+    // This overlay is static: it does not update as the user zooms or scrolls.
+    // Fine for a short-lived preview (the user is about to click Confirm or
+    // Cancel within a few seconds). Silent no-op if no matching chart is open.
+    //
+    internal sealed class GhostPreview
+    {
+        private readonly PairedStopsSettings _settings;
+
+        private Canvas _overlay;
+        private NinjaTrader.Gui.Chart.ChartControl _chart;
+        private System.Windows.Shapes.Line _buyLine;
+        private System.Windows.Shapes.Line _sellLine;
+
+        public GhostPreview(PairedStopsSettings settings) { _settings = settings; }
+
+        public void Show(string instrumentName, double buyPx, double sellPx)
+        {
+            Hide(); // defensive — clears any stale lines
+
+            _chart = FindChart(instrumentName);
+            if (_chart == null) return; // silent — panel confirmation carries the UX
+
+            try
+            {
+                _chart.Dispatcher.Invoke(() =>
+                {
+                    _overlay = FindVisualChildren<Canvas>(_chart).FirstOrDefault();
+                    if (_overlay == null) return;
+
+                    var buyBrush  = (System.Windows.Media.SolidColorBrush)new System.Windows.Media.BrushConverter()
+                                       .ConvertFromString(_settings.PreviewBuyColorArgb);
+                    var sellBrush = (System.Windows.Media.SolidColorBrush)new System.Windows.Media.BrushConverter()
+                                       .ConvertFromString(_settings.PreviewSellColorArgb);
+
+                    _buyLine  = BuildLine(buyPx,  buyBrush);
+                    _sellLine = BuildLine(sellPx, sellBrush);
+                    if (_buyLine  != null) _overlay.Children.Add(_buyLine);
+                    if (_sellLine != null) _overlay.Children.Add(_sellLine);
+                });
+            }
+            catch (Exception ex)
+            {
+                Output.Process($"[PairedStops] Ghost preview render failed: {ex.Message}", PrintTo.OutputTab1);
+            }
+        }
+
+        public void Hide()
+        {
+            if (_chart == null || _overlay == null) { _chart = null; _overlay = null; return; }
+            try
+            {
+                _chart.Dispatcher.Invoke(() =>
+                {
+                    if (_buyLine  != null) _overlay.Children.Remove(_buyLine);
+                    if (_sellLine != null) _overlay.Children.Remove(_sellLine);
+                    _buyLine  = null;
+                    _sellLine = null;
+                });
+            }
+            catch { /* chart was closed; nothing to clean up */ }
+            _chart   = null;
+            _overlay = null;
+        }
+
+        private System.Windows.Shapes.Line BuildLine(double price, System.Windows.Media.Brush brush)
+        {
+            double? y = YForPrice(price);
+            if (y == null) return null;
+
+            return new System.Windows.Shapes.Line
+            {
+                X1                = 0,
+                X2                = _overlay.ActualWidth,
+                Y1                = y.Value,
+                Y2                = y.Value,
+                Stroke            = brush,
+                StrokeThickness   = _settings.PreviewLineWidth,
+                StrokeDashArray   = new System.Windows.Media.DoubleCollection(new[] { 6.0, 4.0 }),
+                IsHitTestVisible  = false,
+                SnapsToDevicePixels = true
+            };
+        }
+
+        private double? YForPrice(double price)
+        {
+            try
+            {
+                // ChartScale is the price-to-pixel mapping on the chart's active panel.
+                // Accessed via ChartPanel.ChartScale in most NT8 builds.
+                var chartScaleProp = _chart.GetType().GetProperty("ChartScale");
+                var chartScale     = chartScaleProp?.GetValue(_chart);
+                if (chartScale == null) return null;
+
+                var getY = chartScale.GetType().GetMethod("GetYByValue", new[] { typeof(double) });
+                if (getY == null) return null;
+
+                var y = getY.Invoke(chartScale, new object[] { price });
+                return y is float f ? (double?)f : y is double d ? (double?)d : null;
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        private static NinjaTrader.Gui.Chart.ChartControl FindChart(string instrumentName)
+        {
+            NinjaTrader.Gui.Chart.ChartControl match   = null;
+            NinjaTrader.Gui.Chart.ChartControl focused = null;
+
+            Application.Current.Dispatcher.Invoke(() =>
+            {
+                foreach (Window w in Application.Current.Windows)
+                {
+                    foreach (var chart in FindVisualChildren<NinjaTrader.Gui.Chart.ChartControl>(w))
+                    {
+                        if (chart.Instrument != null && chart.Instrument.FullName == instrumentName)
+                        {
+                            if (match == null) match = chart;
+                            if (w.IsActive)   focused = chart;
+                        }
+                    }
+                }
+            });
+
+            return focused ?? match;
+        }
+
+        private static IEnumerable<T> FindVisualChildren<T>(DependencyObject parent) where T : DependencyObject
+        {
+            if (parent == null) yield break;
+            int count = System.Windows.Media.VisualTreeHelper.GetChildrenCount(parent);
+            for (int i = 0; i < count; i++)
+            {
+                var child = System.Windows.Media.VisualTreeHelper.GetChild(parent, i);
+                if (child is T hit) yield return hit;
+                foreach (var nested in FindVisualChildren<T>(child)) yield return nested;
+            }
+        }
+    }
+
+    // -------------------------------------------------------------------------
     // PairState + PairManager
     // -------------------------------------------------------------------------
     internal sealed class PairState
@@ -356,6 +507,7 @@ namespace NinjaTrader.NinjaScript.AddOns.PairedStops
         private PendingPair _pendingPair;
         private Account    _subscribedAccount;
 
+        private readonly GhostPreview     _ghost;
         private readonly DispatcherTimer _sessionTimer;
         private DateTime _lastSessionTickEt;
 
@@ -363,6 +515,7 @@ namespace NinjaTrader.NinjaScript.AddOns.PairedStops
         {
             _view     = view;
             _settings = settings;
+            _ghost    = new GhostPreview(settings);
 
             ResubscribeToSelectedAccount();
 
@@ -604,6 +757,7 @@ namespace NinjaTrader.NinjaScript.AddOns.PairedStops
         // -------------------------------------------------------------------
         private void ShowPreviewStrip(double buyPx, double sellPx)
         {
+            _ghost.Show(_view.InstrumentBox.Text.Trim(), buyPx, sellPx);
             _view.Dispatcher.BeginInvoke(new Action(() =>
             {
                 _view.PreviewText.Text = $"Place buy stop @ {buyPx}, sell stop @ {sellPx} — ";
@@ -613,6 +767,7 @@ namespace NinjaTrader.NinjaScript.AddOns.PairedStops
 
         private void HidePreviewStrip()
         {
+            _ghost.Hide();
             _view.Dispatcher.BeginInvoke(new Action(() =>
             {
                 _view.PreviewStrip.Visibility = Visibility.Collapsed;
