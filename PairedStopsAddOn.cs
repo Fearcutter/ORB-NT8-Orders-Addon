@@ -186,6 +186,32 @@ namespace NinjaTrader.NinjaScript.AddOns.PairedStops
     }
 
     // -------------------------------------------------------------------------
+    // Pure arithmetic helpers — no NT dependencies, trivially reasoned about
+    // -------------------------------------------------------------------------
+    public static class PriceMath
+    {
+        /// <summary>Rounds a raw price to the nearest tick-size multiple.</summary>
+        public static double RoundToTick(double price, double tickSize)
+        {
+            if (tickSize <= 0)
+                throw new ArgumentOutOfRangeException(nameof(tickSize), "Tick size must be positive.");
+            return Math.Round(price / tickSize, MidpointRounding.AwayFromZero) * tickSize;
+        }
+
+        /// <summary>Computes buy/sell stop prices around a reference, both tick-rounded.</summary>
+        public static void ComputePair(double reference, double offsetPoints, double tickSize,
+                                       out double buyStop, out double sellStop)
+        {
+            buyStop  = RoundToTick(reference + offsetPoints, tickSize);
+            sellStop = RoundToTick(reference - offsetPoints, tickSize);
+        }
+
+        /// <summary>True when two order prices agree within half a tick.</summary>
+        public static bool PricesEqual(double a, double b, double tickSize)
+            => Math.Abs(a - b) < tickSize * 0.5;
+    }
+
+    // -------------------------------------------------------------------------
     // AddOn entry point
     // -------------------------------------------------------------------------
     public class PairedStopsAddOn : AddOnBase
