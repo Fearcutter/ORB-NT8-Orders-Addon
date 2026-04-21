@@ -32,6 +32,160 @@ using NinjaTrader.NinjaScript;
 namespace NinjaTrader.NinjaScript.AddOns.PairedStops
 {
     // -------------------------------------------------------------------------
+    // Settings model + persistence
+    // -------------------------------------------------------------------------
+    public class PairedStopsSettings
+    {
+        public double OffsetPoints { get; set; } = 10.0;
+        public int    Quantity     { get; set; } = 1;
+
+        public string AccountName    { get; set; } = "";           // empty = auto-pick first
+        public string InstrumentName { get; set; } = "NQ 06-26";   // user overrides per session
+
+        public bool GhostPreviewEnabled { get; set; } = false;
+
+        // Colors stored as ARGB hex to keep JSON primitive.
+        public string PreviewBuyColorArgb  { get; set; } = "#FF00C853";
+        public string PreviewSellColorArgb { get; set; } = "#FFD50000";
+        public double PreviewLineWidth     { get; set; } = 2.0;
+        public string PreviewDashStyle     { get; set; } = "Dashed";
+
+        public string PairTagPrefix { get; set; } = "PAIRSTOP_";
+
+        public bool AudibleDragSync { get; set; } = false;
+    }
+
+    public static class SettingsStore
+    {
+        private static readonly string SettingsDir = System.IO.Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments),
+            "NinjaTrader 8", "bin", "Custom", "AddOns", "PairedStops");
+
+        private static readonly string SettingsPath = System.IO.Path.Combine(SettingsDir, "settings.json");
+
+        public static PairedStopsSettings Load()
+        {
+            try
+            {
+                if (!System.IO.File.Exists(SettingsPath)) return new PairedStopsSettings();
+                var json = System.IO.File.ReadAllText(SettingsPath);
+                return SimpleJson.Deserialize(json) ?? new PairedStopsSettings();
+            }
+            catch (Exception ex)
+            {
+                Output.Process($"[PairedStops] Settings load failed: {ex.Message}. Using defaults.",
+                               PrintTo.OutputTab1);
+                return new PairedStopsSettings();
+            }
+        }
+
+        public static void Save(PairedStopsSettings settings)
+        {
+            try
+            {
+                System.IO.Directory.CreateDirectory(SettingsDir);
+                System.IO.File.WriteAllText(SettingsPath, SimpleJson.Serialize(settings));
+            }
+            catch (Exception ex)
+            {
+                Output.Process($"[PairedStops] Settings save failed: {ex.Message}", PrintTo.OutputTab1);
+            }
+        }
+    }
+
+    // Minimal JSON serializer for PairedStopsSettings — avoids taking a dependency on
+    // System.Text.Json or Newtonsoft, neither of which are guaranteed-available in the
+    // NT8 custom AddOn assembly. The schema is fixed and small, so hand-rolled is fine.
+    internal static class SimpleJson
+    {
+        public static string Serialize(PairedStopsSettings s)
+        {
+            var sb = new System.Text.StringBuilder();
+            sb.Append("{\n");
+            AppendNum(sb, "OffsetPoints", s.OffsetPoints, isLast: false);
+            AppendNum(sb, "Quantity", s.Quantity, isLast: false);
+            AppendStr(sb, "AccountName", s.AccountName, isLast: false);
+            AppendStr(sb, "InstrumentName", s.InstrumentName, isLast: false);
+            AppendBool(sb, "GhostPreviewEnabled", s.GhostPreviewEnabled, isLast: false);
+            AppendStr(sb, "PreviewBuyColorArgb", s.PreviewBuyColorArgb, isLast: false);
+            AppendStr(sb, "PreviewSellColorArgb", s.PreviewSellColorArgb, isLast: false);
+            AppendNum(sb, "PreviewLineWidth", s.PreviewLineWidth, isLast: false);
+            AppendStr(sb, "PreviewDashStyle", s.PreviewDashStyle, isLast: false);
+            AppendStr(sb, "PairTagPrefix", s.PairTagPrefix, isLast: false);
+            AppendBool(sb, "AudibleDragSync", s.AudibleDragSync, isLast: true);
+            sb.Append("}\n");
+            return sb.ToString();
+        }
+
+        public static PairedStopsSettings Deserialize(string json)
+        {
+            if (string.IsNullOrWhiteSpace(json)) return new PairedStopsSettings();
+            var s = new PairedStopsSettings();
+            foreach (var (k, v) in ExtractFields(json))
+            {
+                switch (k)
+                {
+                    case "OffsetPoints":        if (double.TryParse(v, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var o)) s.OffsetPoints = o; break;
+                    case "Quantity":            if (int.TryParse(v, out var q)) s.Quantity = q; break;
+                    case "AccountName":         s.AccountName = Unquote(v); break;
+                    case "InstrumentName":      s.InstrumentName = Unquote(v); break;
+                    case "GhostPreviewEnabled": s.GhostPreviewEnabled = (v == "true"); break;
+                    case "PreviewBuyColorArgb": s.PreviewBuyColorArgb = Unquote(v); break;
+                    case "PreviewSellColorArgb":s.PreviewSellColorArgb = Unquote(v); break;
+                    case "PreviewLineWidth":    if (double.TryParse(v, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var w)) s.PreviewLineWidth = w; break;
+                    case "PreviewDashStyle":    s.PreviewDashStyle = Unquote(v); break;
+                    case "PairTagPrefix":       s.PairTagPrefix = Unquote(v); break;
+                    case "AudibleDragSync":     s.AudibleDragSync = (v == "true"); break;
+                }
+            }
+            return s;
+        }
+
+        private static void AppendStr (System.Text.StringBuilder sb, string k, string v, bool isLast) => sb.Append("  \"").Append(k).Append("\": \"").Append(Escape(v ?? "")).Append('"').Append(isLast ? "\n" : ",\n");
+        private static void AppendNum (System.Text.StringBuilder sb, string k, double v, bool isLast) => sb.Append("  \"").Append(k).Append("\": ").Append(v.ToString(System.Globalization.CultureInfo.InvariantCulture)).Append(isLast ? "\n" : ",\n");
+        private static void AppendNum (System.Text.StringBuilder sb, string k, int    v, bool isLast) => sb.Append("  \"").Append(k).Append("\": ").Append(v.ToString(System.Globalization.CultureInfo.InvariantCulture)).Append(isLast ? "\n" : ",\n");
+        private static void AppendBool(System.Text.StringBuilder sb, string k, bool   v, bool isLast) => sb.Append("  \"").Append(k).Append("\": ").Append(v ? "true" : "false").Append(isLast ? "\n" : ",\n");
+        private static string Escape(string s) => s.Replace("\\", "\\\\").Replace("\"", "\\\"");
+        private static string Unquote(string v) { v = v.Trim(); if (v.StartsWith("\"") && v.EndsWith("\"")) v = v.Substring(1, v.Length - 2); return v.Replace("\\\"", "\"").Replace("\\\\", "\\"); }
+
+        private static IEnumerable<(string key, string value)> ExtractFields(string json)
+        {
+            // Dumb but sufficient for our flat schema: split by top-level commas/newlines, then key/value on first ':'.
+            int depth = 0, i = 0;
+            bool inString = false;
+            var chunks = new List<string>();
+            var current = new System.Text.StringBuilder();
+            for (; i < json.Length; i++)
+            {
+                char c = json[i];
+                if (c == '"' && (i == 0 || json[i - 1] != '\\')) inString = !inString;
+                if (!inString)
+                {
+                    if (c == '{' || c == '[') depth++;
+                    else if (c == '}' || c == ']') depth--;
+                    if ((c == ',' || c == '\n') && depth <= 1)
+                    {
+                        if (current.Length > 0) chunks.Add(current.ToString()); current.Clear(); continue;
+                    }
+                }
+                current.Append(c);
+            }
+            if (current.Length > 0) chunks.Add(current.ToString());
+
+            foreach (var raw in chunks)
+            {
+                var trimmed = raw.Trim().TrimStart('{').TrimEnd('}').Trim();
+                if (string.IsNullOrEmpty(trimmed)) continue;
+                int colon = trimmed.IndexOf(':');
+                if (colon < 0) continue;
+                var key   = trimmed.Substring(0, colon).Trim().Trim('"');
+                var value = trimmed.Substring(colon + 1).Trim();
+                yield return (key, value);
+            }
+        }
+    }
+
+    // -------------------------------------------------------------------------
     // AddOn entry point
     // -------------------------------------------------------------------------
     public class PairedStopsAddOn : AddOnBase
