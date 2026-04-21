@@ -339,12 +339,21 @@ namespace NinjaTrader.NinjaScript.AddOns.PairedStops
 
     internal sealed class PairManager : IDisposable
     {
+        private sealed class PendingPair
+        {
+            public Instrument Instrument;
+            public int        Quantity;
+            public double     BuyPx;
+            public double     SellPx;
+        }
+
         private readonly PairedStopsView     _view;
         private readonly PairedStopsSettings _settings;
         private readonly object _sync = new object();
 
         private bool       _programmatic;
         private PairState  _state;
+        private PendingPair _pendingPair;
         private Account    _subscribedAccount;
 
         private readonly DispatcherTimer _sessionTimer;
@@ -359,8 +368,10 @@ namespace NinjaTrader.NinjaScript.AddOns.PairedStops
 
             _view.AccountCombo.SelectionChanged += (s, e) => ResubscribeToSelectedAccount();
 
-            _view.PlaceButton.Click  += (s, e) => OnPlaceClicked();
-            _view.CancelButton.Click += (s, e) => OnCancelClicked();
+            _view.PlaceButton.Click         += (s, e) => OnPlaceClicked();
+            _view.CancelButton.Click        += (s, e) => OnCancelClicked();
+            _view.PreviewConfirmButton.Click += (s, e) => OnPreviewConfirm();
+            _view.PreviewCancelButton.Click  += (s, e) => OnPreviewCancel();
 
             _sessionTimer = new DispatcherTimer { Interval = TimeSpan.FromMinutes(1) };
             _sessionTimer.Tick += OnSessionTimerTick;
@@ -525,8 +536,9 @@ namespace NinjaTrader.NinjaScript.AddOns.PairedStops
         {
             lock (_sync)
             {
-                if (_state != null)                 { _view.SetStatus("Pair already active — cancel first.", isError: true); return; }
-                if (_subscribedAccount == null)     { _view.SetStatus("No account selected.",                 isError: true); return; }
+                if (_state != null)             { _view.SetStatus("Pair already active — cancel first.",        isError: true); return; }
+                if (_pendingPair != null)       { _view.SetStatus("Preview already pending — confirm or cancel.", isError: true); return; }
+                if (_subscribedAccount == null) { _view.SetStatus("No account selected.",                         isError: true); return; }
 
                 var instrumentName = _view.InstrumentBox.Text.Trim();
                 var instrument     = Instrument.GetInstrument(instrumentName);
@@ -570,8 +582,62 @@ namespace NinjaTrader.NinjaScript.AddOns.PairedStops
                     return;
                 }
 
+                if (_settings.GhostPreviewEnabled)
+                {
+                    _pendingPair = new PendingPair
+                    {
+                        Instrument = instrument,
+                        Quantity   = qty,
+                        BuyPx      = buyPx,
+                        SellPx     = sellPx
+                    };
+                    ShowPreviewStrip(buyPx, sellPx);
+                    return;
+                }
+
                 SubmitPair(instrument, qty, buyPx, sellPx);
             }
+        }
+
+        // -------------------------------------------------------------------
+        // Ghost preview — inline panel confirmation strip
+        // -------------------------------------------------------------------
+        private void ShowPreviewStrip(double buyPx, double sellPx)
+        {
+            _view.Dispatcher.BeginInvoke(new Action(() =>
+            {
+                _view.PreviewText.Text = $"Place buy stop @ {buyPx}, sell stop @ {sellPx} — ";
+                _view.PreviewStrip.Visibility = Visibility.Visible;
+            }));
+        }
+
+        private void HidePreviewStrip()
+        {
+            _view.Dispatcher.BeginInvoke(new Action(() =>
+            {
+                _view.PreviewStrip.Visibility = Visibility.Collapsed;
+                _view.PreviewText.Text        = "";
+            }));
+        }
+
+        private void OnPreviewConfirm()
+        {
+            PendingPair pending;
+            lock (_sync)
+            {
+                pending      = _pendingPair;
+                _pendingPair = null;
+            }
+            HidePreviewStrip();
+            if (pending == null) return;
+            lock (_sync) { SubmitPair(pending.Instrument, pending.Quantity, pending.BuyPx, pending.SellPx); }
+        }
+
+        private void OnPreviewCancel()
+        {
+            lock (_sync) { _pendingPair = null; }
+            HidePreviewStrip();
+            _view.SetStatus("Preview cancelled.");
         }
 
         private void SubmitPair(Instrument instrument, int qty, double buyPx, double sellPx)
