@@ -580,6 +580,18 @@ namespace NinjaTrader.NinjaScript.AddOns.PairedStops
 
         private void OnAccountOrderUpdate(object sender, OrderEventArgs e)
         {
+            // Diagnostic: log every OrderUpdate received. Remove once drag-sync is verified working.
+            try
+            {
+                Output.Process(
+                    $"[PairedStops] OrderUpdate: name={e.Order?.Name ?? "(null)"} " +
+                    $"state={e.Order?.OrderState} stop={e.Order?.StopPrice} " +
+                    $"tracked={(_state != null && e.Order != null && _state.Contains(e.Order))} " +
+                    $"programmatic={_programmatic}",
+                    PrintTo.OutputTab1);
+            }
+            catch { /* logging must never break the handler */ }
+
             PairState snapshot;
             lock (_sync)
             {
@@ -600,10 +612,15 @@ namespace NinjaTrader.NinjaScript.AddOns.PairedStops
                     : e.Order.StopPrice + snapshot.ExpectedSpread;
                 expectedPartnerPx = PriceMath.RoundToTick(expectedPartnerPx, tickSize);
 
+                try { Output.Process($"[PairedStops] Drag-sync check: moved={e.Order.Name} movedStop={e.Order.StopPrice} partnerStop={partner.StopPrice} expected={expectedPartnerPx}", PrintTo.OutputTab1); } catch { }
+
                 // Second line of defense against the threaded echo: if the partner is
                 // already at the expected price, there's nothing to sync.
                 if (PriceMath.PricesEqual(partner.StopPrice, expectedPartnerPx, tickSize))
+                {
+                    try { Output.Process("[PairedStops] Drag-sync short-circuit: prices already equal.", PrintTo.OutputTab1); } catch { }
                     return;
+                }
 
                 bool acquired = false;
                 try
