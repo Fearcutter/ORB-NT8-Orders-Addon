@@ -610,9 +610,46 @@ namespace NinjaTrader.NinjaScript.AddOns.PairedStops
                 {
                     lock (_sync) { _programmatic = true; acquired = true; }
 
-                    // NT8 unmanaged-order modification: mutate price via Order.Update,
-                    // which propagates the change to the broker internally.
-                    partner.Update(partner.Quantity, 0, expectedPartnerPx);
+                    // Cancel-and-recreate: the safest way to move an unmanaged stop
+                    // in NT8. We hold _programmatic = true across the whole sequence
+                    // so the cancel echo, the new-order Accepted event, and the new
+                    // Working event all get suppressed in our handler.
+                    var instrument      = partner.Instrument;
+                    var qty             = partner.Quantity;
+                    var movedIsBuy      = e.Order == snapshot.Buy;
+                    var partnerIsBuy    = !movedIsBuy;
+                    var partnerAction   = partnerIsBuy ? OrderAction.Buy : OrderAction.SellShort;
+                    var partnerName     = partner.Name; // preserve the PAIRSTOP_<guid>_{BUY|SELL} tag
+
+                    _subscribedAccount.Cancel(new[] { partner });
+
+                    var newPartner = _subscribedAccount.CreateOrder(
+                        instrument,
+                        partnerAction,
+                        OrderType.StopMarket,
+                        OrderEntry.Manual,
+                        TimeInForce.Day,
+                        qty,
+                        0,
+                        expectedPartnerPx,
+                        string.Empty,
+                        partnerName,
+                        Core.Globals.MaxDate,
+                        null);
+                    _subscribedAccount.Submit(new[] { newPartner });
+
+                    // Swap the partner reference in tracking state so subsequent
+                    // events on the old partner are ignored and new events on the
+                    // new partner are recognized.
+                    lock (_sync)
+                    {
+                        if (_state == snapshot)
+                        {
+                            _state = movedIsBuy
+                                ? new PairState(snapshot.PairId, snapshot.Buy, newPartner, snapshot.ExpectedSpread)
+                                : new PairState(snapshot.PairId, newPartner, snapshot.Sell, snapshot.ExpectedSpread);
+                        }
+                    }
 
                     if (_settings.AudibleDragSync)
                     {
@@ -671,7 +708,7 @@ namespace NinjaTrader.NinjaScript.AddOns.PairedStops
 
                 bool isReject = e.Order.OrderState == OrderState.Rejected;
                 string msg    = isReject
-                    ? $"Order rejected: {e.Order.Error}"
+                    ? $"Order rejected: {e.Error}"
                     : "One leg cancelled — partner cancelled to preserve pair integrity.";
                 _view.SetStatus(msg, isError: isReject);
                 return;
