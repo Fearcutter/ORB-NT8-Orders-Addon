@@ -20,6 +20,7 @@ using System.Linq;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Threading;
+using System.Xml.Linq;
 using NinjaTrader.Cbi;
 using NinjaTrader.Code;
 using NinjaTrader.Core;
@@ -211,6 +212,83 @@ namespace NinjaTrader.NinjaScript.AddOns.PairedStops
         /// <summary>True when two order prices agree within half a tick.</summary>
         public static bool PricesEqual(double a, double b, double tickSize)
             => Math.Abs(a - b) < tickSize * 0.5;
+    }
+
+    // -------------------------------------------------------------------------
+    // ATM template loader — reads NT's stored AtmStrategy XML so we can honor
+    // the user's template without relying on the NT ATM API (unreachable from
+    // AddOn context). Supports the common fixed TP/SL bracket.
+    // -------------------------------------------------------------------------
+    internal sealed class AtmTemplate
+    {
+        public int    TargetValue   { get; }   // raw from XML
+        public int    StopLossValue { get; }   // raw from XML
+        public string Mode          { get; }   // "Ticks" or "Points"
+
+        public AtmTemplate(int target, int stopLoss, string mode)
+        {
+            TargetValue   = target;
+            StopLossValue = stopLoss;
+            Mode          = string.IsNullOrEmpty(mode) ? "Ticks" : mode;
+        }
+
+        /// <summary>Loads an ATM template by name from NT's templates directory. Returns null if missing or malformed.</summary>
+        public static AtmTemplate Load(string templateName)
+        {
+            if (string.IsNullOrWhiteSpace(templateName)) return null;
+
+            var path = System.IO.Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments),
+                "NinjaTrader 8", "templates", "AtmStrategy", templateName + ".xml");
+
+            if (!System.IO.File.Exists(path))
+            {
+                Output.Process($"[PairedStops] ATM template not found: {path}", PrintTo.OutputTab1);
+                return null;
+            }
+
+            try
+            {
+                var doc = XDocument.Load(path);
+                var atm = doc.Descendants("AtmStrategy").FirstOrDefault();
+                if (atm == null) return null;
+
+                var bracket = atm.Descendants("Bracket").FirstOrDefault();
+                if (bracket == null) return null;
+
+                int sl  = ParseIntElement(bracket, "StopLoss", 0);
+                int tgt = ParseIntElement(bracket, "Target",   0);
+                if (sl <= 0 || tgt <= 0) return null;
+
+                string mode = atm.Element("CalculationMode")?.Value ?? "Ticks";
+                return new AtmTemplate(tgt, sl, mode);
+            }
+            catch (Exception ex)
+            {
+                Output.Process($"[PairedStops] ATM template parse failed: {ex.Message}", PrintTo.OutputTab1);
+                return null;
+            }
+        }
+
+        /// <summary>Derives the TP and SL prices from a fill price, using the template's Mode and the instrument's tick size.</summary>
+        public void ComputeExits(double fillPrice, bool isLong, Instrument instrument,
+                                 out double tpPrice, out double slPrice)
+        {
+            double tick = instrument.MasterInstrument.TickSize;
+            double unit = Mode == "Points" ? 1.0 : tick;
+
+            double tpDist = TargetValue   * unit;
+            double slDist = StopLossValue * unit;
+
+            tpPrice = PriceMath.RoundToTick(isLong ? fillPrice + tpDist : fillPrice - tpDist, tick);
+            slPrice = PriceMath.RoundToTick(isLong ? fillPrice - slDist : fillPrice + slDist, tick);
+        }
+
+        private static int ParseIntElement(XElement parent, string name, int fallback)
+        {
+            var e = parent.Element(name);
+            return e != null && int.TryParse(e.Value, out var v) ? v : fallback;
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -696,7 +774,7 @@ namespace NinjaTrader.NinjaScript.AddOns.PairedStops
                 return;
             }
 
-            // OCO on fill.
+            // OCO on fill. Cancel the partner, then submit TP/SL per the ATM template.
             if (e.Order.OrderState == OrderState.Filled)
             {
                 var partner = snapshot.PartnerOf(e.Order);
@@ -710,12 +788,9 @@ namespace NinjaTrader.NinjaScript.AddOns.PairedStops
                     }
                 }
                 lock (_sync) { if (_state == snapshot) _state = null; }
-                var side = e.Order == snapshot.Buy ? "Buy" : "Sell";
-                var atm  = (_settings.AtmTemplate ?? "").Trim();
-                var note = string.IsNullOrEmpty(atm)
-                    ? "engage your ATM manually in Chart Trader."
-                    : $"engage ATM template '{atm}' manually in Chart Trader.";
-                _view.SetStatus($"{side} stop filled — partner cancelled. Now {note}", isError: true);
+
+                bool isLong = (e.Order == snapshot.Buy);
+                ApplyTemplateOnFill(e.Order, isLong);
                 return;
             }
 
@@ -942,6 +1017,80 @@ namespace NinjaTrader.NinjaScript.AddOns.PairedStops
 
                 _state = null;
                 _view.SetStatus("Pair cancelled.");
+            }
+        }
+
+        // -------------------------------------------------------------------
+        // Template-driven TP/SL on fill
+        // -------------------------------------------------------------------
+        private void ApplyTemplateOnFill(Order filledOrder, bool isLong)
+        {
+            var side         = isLong ? "Buy" : "Sell";
+            var templateName = (_settings.AtmTemplate ?? "").Trim();
+
+            if (string.IsNullOrEmpty(templateName))
+            {
+                _view.SetStatus($"{side} filled — no ATM template set; no TP/SL submitted.", isError: true);
+                return;
+            }
+
+            var template = AtmTemplate.Load(templateName);
+            if (template == null)
+            {
+                _view.SetStatus(
+                    $"{side} filled — template '{templateName}' not found or malformed. " +
+                    "Flatten manually or engage ATM in Chart Trader.",
+                    isError: true);
+                return;
+            }
+
+            var fillPrice = filledOrder.AverageFillPrice;
+            if (fillPrice <= 0)
+            {
+                _view.SetStatus($"{side} filled — fill price unavailable; no TP/SL submitted.", isError: true);
+                return;
+            }
+
+            template.ComputeExits(fillPrice, isLong, filledOrder.Instrument,
+                                  out var tpPx, out var slPx);
+
+            var ocoId       = "PSEXIT_" + Guid.NewGuid().ToString("N").Substring(0, 10);
+            var qty         = filledOrder.Quantity;
+            var exitAction  = isLong ? OrderAction.Sell : OrderAction.BuyToCover;
+            var instrument  = filledOrder.Instrument;
+
+            Order tpOrder = null, slOrder = null;
+            try
+            {
+                tpOrder = _subscribedAccount.CreateOrder(
+                    instrument, exitAction, OrderType.Limit, OrderEntry.Manual,
+                    TimeInForce.Day, qty,
+                    /* limit */ tpPx, /* stop */ 0,
+                    ocoId, ocoId + "_TP",
+                    Core.Globals.MaxDate, null);
+                _subscribedAccount.Submit(new[] { tpOrder });
+
+                slOrder = _subscribedAccount.CreateOrder(
+                    instrument, exitAction, OrderType.StopMarket, OrderEntry.Manual,
+                    TimeInForce.Day, qty,
+                    0, slPx,
+                    ocoId, ocoId + "_SL",
+                    Core.Globals.MaxDate, null);
+                _subscribedAccount.Submit(new[] { slOrder });
+
+                _view.SetStatus(
+                    $"{side} filled @ {fillPrice} — {templateName}: TP @ {tpPx}, SL @ {slPx}. " +
+                    "Do NOT also engage ATM in Chart Trader.");
+            }
+            catch (Exception ex)
+            {
+                _view.SetStatus($"TP/SL submit failed: {ex.Message}. Flatten manually.", isError: true);
+                Output.Process($"[PairedStops] TP/SL submit failed: {ex}", PrintTo.OutputTab1);
+                // Best-effort rollback if only the TP made it through.
+                if (tpOrder != null && slOrder == null)
+                {
+                    try { _subscribedAccount.Cancel(new[] { tpOrder }); } catch { }
+                }
             }
         }
 
