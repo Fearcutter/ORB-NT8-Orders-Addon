@@ -347,6 +347,9 @@ namespace NinjaTrader.NinjaScript.AddOns.PairedStops
         private PairState  _state;
         private Account    _subscribedAccount;
 
+        private readonly DispatcherTimer _sessionTimer;
+        private DateTime _lastSessionTickEt;
+
         public PairManager(PairedStopsView view, PairedStopsSettings settings)
         {
             _view     = view;
@@ -358,6 +361,39 @@ namespace NinjaTrader.NinjaScript.AddOns.PairedStops
 
             _view.PlaceButton.Click  += (s, e) => OnPlaceClicked();
             _view.CancelButton.Click += (s, e) => OnCancelClicked();
+
+            _sessionTimer = new DispatcherTimer { Interval = TimeSpan.FromMinutes(1) };
+            _sessionTimer.Tick += OnSessionTimerTick;
+            _sessionTimer.Start();
+            _lastSessionTickEt = NowEt();
+        }
+
+        private static DateTime NowEt()
+        {
+            try
+            {
+                var etZone = TimeZoneInfo.FindSystemTimeZoneById("Eastern Standard Time");
+                return TimeZoneInfo.ConvertTimeFromUtc(DateTime.UtcNow, etZone);
+            }
+            catch (TimeZoneNotFoundException)
+            {
+                // Fallback for non-Windows TZ database (unlikely on NT8 but safe).
+                return DateTime.UtcNow.AddHours(-5);
+            }
+        }
+
+        private void OnSessionTimerTick(object sender, EventArgs e)
+        {
+            var nowEt        = NowEt();
+            var todayBoundary = nowEt.Date.AddHours(18); // 18:00 ET — CME session start
+
+            if (_lastSessionTickEt < todayBoundary && nowEt >= todayBoundary)
+            {
+                lock (_sync) { _state = null; }
+                _view.SetStatus("Session rollover — tracking state cleared.");
+                // Live broker-side orders are left alone; they survive the rollover.
+            }
+            _lastSessionTickEt = nowEt;
         }
 
         private void ResubscribeToSelectedAccount()
@@ -628,6 +664,9 @@ namespace NinjaTrader.NinjaScript.AddOns.PairedStops
 
         public void Dispose()
         {
+            _sessionTimer.Stop();
+            _sessionTimer.Tick -= OnSessionTimerTick;
+
             if (_subscribedAccount != null)
             {
                 _subscribedAccount.OrderUpdate -= OnAccountOrderUpdate;
