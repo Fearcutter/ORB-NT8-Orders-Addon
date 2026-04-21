@@ -386,7 +386,31 @@ namespace NinjaTrader.NinjaScript.AddOns.PairedStops
 
         private void OnAccountOrderUpdate(object sender, OrderEventArgs e)
         {
-            // Task 9+ fills this in.
+            PairState snapshot;
+            lock (_sync)
+            {
+                if (_state == null || !_state.Contains(e.Order)) return;
+                snapshot = _state;
+            }
+
+            // OCO on fill.
+            if (e.Order.OrderState == OrderState.Filled)
+            {
+                var partner = snapshot.PartnerOf(e.Order);
+                if (partner != null &&
+                    (partner.OrderState == OrderState.Working || partner.OrderState == OrderState.Accepted))
+                {
+                    try { _subscribedAccount.Cancel(new[] { partner }); }
+                    catch (Exception ex)
+                    {
+                        Output.Process($"[PairedStops] OCO cancel failed: {ex}", PrintTo.OutputTab1);
+                    }
+                }
+                lock (_sync) { if (_state == snapshot) _state = null; }
+                var side = e.Order == snapshot.Buy ? "Buy" : "Sell";
+                _view.SetStatus($"{side} stop filled — partner cancelled.");
+                return;
+            }
         }
 
         // -------------------------------------------------------------------
