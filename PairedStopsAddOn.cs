@@ -292,22 +292,115 @@ namespace NinjaTrader.NinjaScript.AddOns.PairedStops
     {
         private readonly PairedStopsSettings _settings;
         private readonly PairedStopsView     _view;
+        private readonly PairManager         _manager;
 
         public PairedStopsTab()
         {
             _settings = SettingsStore.Load();
             _view     = new PairedStopsView(_settings);
+            _manager  = new PairManager(_view, _settings);
             Content   = _view;
         }
 
         public override void Cleanup()
         {
+            _manager.Dispose();
             SettingsStore.Save(_settings);
         }
 
         protected override string GetHeaderSubText() => "Paired Stops";
         protected override void RestoreFromXElement(XElement element) { }
         protected override void SaveToXElement(XElement element) { }
+    }
+
+    // -------------------------------------------------------------------------
+    // PairState + PairManager
+    // -------------------------------------------------------------------------
+    internal sealed class PairState
+    {
+        public Guid     PairId         { get; }
+        public Order    Buy            { get; }
+        public Order    Sell           { get; }
+        public double   ExpectedSpread { get; }   // buyPx - sellPx at placement
+        public DateTime CreatedUtc     { get; }
+
+        public PairState(Guid pairId, Order buy, Order sell, double expectedSpread)
+        {
+            PairId         = pairId;
+            Buy            = buy;
+            Sell           = sell;
+            ExpectedSpread = expectedSpread;
+            CreatedUtc     = DateTime.UtcNow;
+        }
+
+        public Order PartnerOf(Order o) => o == Buy ? Sell : (o == Sell ? Buy : null);
+        public bool  Contains (Order o) => o == Buy || o == Sell;
+    }
+
+    internal sealed class PairManager : IDisposable
+    {
+        private readonly PairedStopsView     _view;
+        private readonly PairedStopsSettings _settings;
+        private readonly object _sync = new object();
+
+        private bool       _programmatic;
+        private PairState  _state;
+        private Account    _subscribedAccount;
+
+        public PairManager(PairedStopsView view, PairedStopsSettings settings)
+        {
+            _view     = view;
+            _settings = settings;
+
+            ResubscribeToSelectedAccount();
+
+            _view.AccountCombo.SelectionChanged += (s, e) => ResubscribeToSelectedAccount();
+
+            _view.PlaceButton.Click  += (s, e) => OnPlaceClicked();
+            _view.CancelButton.Click += (s, e) => OnCancelClicked();
+        }
+
+        private void ResubscribeToSelectedAccount()
+        {
+            if (_subscribedAccount != null)
+            {
+                _subscribedAccount.OrderUpdate -= OnAccountOrderUpdate;
+                _subscribedAccount = null;
+            }
+
+            var name = _view.AccountCombo.SelectedItem as string;
+            if (string.IsNullOrEmpty(name)) return;
+
+            Account account = null;
+            try { account = Account.All.FirstOrDefault(a => a.Name == name); }
+            catch (Exception ex)
+            {
+                Output.Process($"[PairedStops] Account lookup failed: {ex.Message}", PrintTo.OutputTab1);
+                return;
+            }
+            if (account == null) return;
+
+            _subscribedAccount = account;
+            _subscribedAccount.OrderUpdate += OnAccountOrderUpdate;
+        }
+
+        private void OnAccountOrderUpdate(object sender, OrderEventArgs e)
+        {
+            // Task 9+ fills this in.
+        }
+
+        // Stubs — replaced in Tasks 7 and 8.
+        private void OnPlaceClicked()  => _view.SetStatus("Place: stub — implemented in Task 7.");
+        private void OnCancelClicked() => _view.SetStatus("Cancel: stub — implemented in Task 8.");
+
+        public void Dispose()
+        {
+            if (_subscribedAccount != null)
+            {
+                _subscribedAccount.OrderUpdate -= OnAccountOrderUpdate;
+                _subscribedAccount = null;
+            }
+        }
     }
 
     // -------------------------------------------------------------------------
