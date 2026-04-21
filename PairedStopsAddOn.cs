@@ -502,9 +502,36 @@ namespace NinjaTrader.NinjaScript.AddOns.PairedStops
         }
 
         // -------------------------------------------------------------------
-        // Cancel — replaced in Task 8
+        // Cancel
         // -------------------------------------------------------------------
-        private void OnCancelClicked() => _view.SetStatus("Cancel: stub — implemented in Task 8.");
+        private void OnCancelClicked()
+        {
+            lock (_sync)
+            {
+                if (_state == null)
+                {
+                    _view.SetStatus("No active pair to cancel.");
+                    return;
+                }
+
+                var toCancel = new List<Order>();
+                if (_state.Buy.OrderState  == OrderState.Working || _state.Buy.OrderState  == OrderState.Accepted) toCancel.Add(_state.Buy);
+                if (_state.Sell.OrderState == OrderState.Working || _state.Sell.OrderState == OrderState.Accepted) toCancel.Add(_state.Sell);
+
+                if (toCancel.Count > 0)
+                {
+                    try { _subscribedAccount.Cancel(toCancel.ToArray()); }
+                    catch (Exception ex)
+                    {
+                        _view.SetStatus($"Cancel failed: {ex.Message}", isError: true);
+                        Output.Process($"[PairedStops] Cancel failed: {ex}", PrintTo.OutputTab1);
+                    }
+                }
+
+                _state = null;
+                _view.SetStatus("Pair cancelled.");
+            }
+        }
 
         public void Dispose()
         {
