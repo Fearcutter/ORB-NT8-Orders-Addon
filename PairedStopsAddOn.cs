@@ -389,8 +389,53 @@ namespace NinjaTrader.NinjaScript.AddOns.PairedStops
             PairState snapshot;
             lock (_sync)
             {
+                if (_programmatic) return;                      // our own ChangeOrder echoing back
                 if (_state == null || !_state.Contains(e.Order)) return;
                 snapshot = _state;
+            }
+
+            // Drag-sync: a Working update whose price has drifted from the expected spread.
+            if (e.Order.OrderState == OrderState.Working)
+            {
+                double tickSize = e.Order.Instrument.MasterInstrument.TickSize;
+                Order  partner  = snapshot.PartnerOf(e.Order);
+                if (partner == null) return;
+
+                double expectedPartnerPx = e.Order == snapshot.Buy
+                    ? e.Order.StopPrice - snapshot.ExpectedSpread
+                    : e.Order.StopPrice + snapshot.ExpectedSpread;
+                expectedPartnerPx = PriceMath.RoundToTick(expectedPartnerPx, tickSize);
+
+                // Second line of defense against the threaded echo: if the partner is
+                // already at the expected price, there's nothing to sync.
+                if (PriceMath.PricesEqual(partner.StopPrice, expectedPartnerPx, tickSize))
+                    return;
+
+                bool acquired = false;
+                try
+                {
+                    lock (_sync) { _programmatic = true; acquired = true; }
+
+                    _subscribedAccount.ChangeOrder(new[] { partner }, partner.Quantity, 0, expectedPartnerPx);
+
+                    if (_settings.AudibleDragSync)
+                    {
+                        try { System.Media.SystemSounds.Asterisk.Play(); } catch { /* no audio device — ignore */ }
+                    }
+                    _view.SetStatus($"Synced partner to {expectedPartnerPx}.");
+                }
+                catch (Exception ex)
+                {
+                    _view.SetStatus($"Sync failed: {ex.Message}. Pair is now unlinked.", isError: true);
+                    Output.Process($"[PairedStops] Sync failed: {ex}", PrintTo.OutputTab1);
+                    lock (_sync) { if (_state == snapshot) _state = null; }
+                }
+                finally
+                {
+                    if (acquired) lock (_sync) { _programmatic = false; }
+                }
+
+                return;
             }
 
             // OCO on fill.
