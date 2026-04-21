@@ -41,9 +41,7 @@ namespace NinjaTrader.NinjaScript.AddOns.PairedStops
 
         public string AccountName    { get; set; } = "";           // empty = auto-pick first
         public string InstrumentName { get; set; } = "NQ 06-26";   // user overrides per session
-        public string AtmTemplate    { get; set; } = "IMBA";       // shown in fill-reminder message
-
-        public bool GhostPreviewEnabled { get; set; } = false;
+        public string AtmTemplate    { get; set; } = "IMBA";       // XML file read on fill for TP/SL
 
         public string PairTagPrefix { get; set; } = "PAIRSTOP_";
     }
@@ -100,7 +98,6 @@ namespace NinjaTrader.NinjaScript.AddOns.PairedStops
             AppendStr(sb, "AccountName", s.AccountName, isLast: false);
             AppendStr(sb, "InstrumentName", s.InstrumentName, isLast: false);
             AppendStr(sb, "AtmTemplate", s.AtmTemplate, isLast: false);
-            AppendBool(sb, "GhostPreviewEnabled", s.GhostPreviewEnabled, isLast: false);
             AppendStr(sb, "PairTagPrefix", s.PairTagPrefix, isLast: true);
             sb.Append("}\n");
             return sb.ToString();
@@ -119,7 +116,6 @@ namespace NinjaTrader.NinjaScript.AddOns.PairedStops
                     case "AccountName":         s.AccountName = Unquote(v); break;
                     case "InstrumentName":      s.InstrumentName = Unquote(v); break;
                     case "AtmTemplate":         s.AtmTemplate = Unquote(v); break;
-                    case "GhostPreviewEnabled": s.GhostPreviewEnabled = (v == "true"); break;
                     case "PairTagPrefix":       s.PairTagPrefix = Unquote(v); break;
                 }
             }
@@ -397,21 +393,12 @@ namespace NinjaTrader.NinjaScript.AddOns.PairedStops
 
     internal sealed class PairManager : IDisposable
     {
-        private sealed class PendingPair
-        {
-            public Instrument Instrument;
-            public int        Quantity;
-            public double     BuyPx;
-            public double     SellPx;
-        }
-
         private readonly PairedStopsView     _view;
         private readonly PairedStopsSettings _settings;
         private readonly object _sync = new object();
 
         private bool       _programmatic;
         private PairState  _state;
-        private PendingPair _pendingPair;
         private Account    _subscribedAccount;
 
         private readonly DispatcherTimer _sessionTimer;
@@ -426,10 +413,8 @@ namespace NinjaTrader.NinjaScript.AddOns.PairedStops
 
             _view.AccountCombo.SelectionChanged += (s, e) => ResubscribeToSelectedAccount();
 
-            _view.PlaceButton.Click         += (s, e) => OnPlaceClicked();
-            _view.CancelButton.Click        += (s, e) => OnCancelClicked();
-            _view.PreviewConfirmButton.Click += (s, e) => OnPreviewConfirm();
-            _view.PreviewCancelButton.Click  += (s, e) => OnPreviewCancel();
+            _view.PlaceButton.Click  += (s, e) => OnPlaceClicked();
+            _view.CancelButton.Click += (s, e) => OnCancelClicked();
 
             _sessionTimer = new DispatcherTimer { Interval = TimeSpan.FromMinutes(1) };
             _sessionTimer.Tick += OnSessionTimerTick;
@@ -491,18 +476,6 @@ namespace NinjaTrader.NinjaScript.AddOns.PairedStops
 
         private void OnAccountOrderUpdate(object sender, OrderEventArgs e)
         {
-            // Diagnostic: log every OrderUpdate received. Remove once drag-sync is verified working.
-            try
-            {
-                Output.Process(
-                    $"[PairedStops] OrderUpdate: name={e.Order?.Name ?? "(null)"} " +
-                    $"state={e.Order?.OrderState} stop={e.Order?.StopPrice} " +
-                    $"tracked={(_state != null && e.Order != null && _state.Contains(e.Order))} " +
-                    $"programmatic={_programmatic}",
-                    PrintTo.OutputTab1);
-            }
-            catch { /* logging must never break the handler */ }
-
             PairState snapshot;
             lock (_sync)
             {
@@ -528,15 +501,9 @@ namespace NinjaTrader.NinjaScript.AddOns.PairedStops
                     : e.Order.StopPrice + snapshot.ExpectedSpread;
                 expectedPartnerPx = PriceMath.RoundToTick(expectedPartnerPx, tickSize);
 
-                try { Output.Process($"[PairedStops] Drag-sync check: moved={e.Order.Name} movedStop={e.Order.StopPrice} partnerStop={partner.StopPrice} expected={expectedPartnerPx}", PrintTo.OutputTab1); } catch { }
-
-                // Second line of defense against the threaded echo: if the partner is
-                // already at the expected price, there's nothing to sync.
+                // Short-circuit: if the partner is already at the expected price, nothing to sync.
                 if (PriceMath.PricesEqual(partner.StopPrice, expectedPartnerPx, tickSize))
-                {
-                    try { Output.Process("[PairedStops] Drag-sync short-circuit: prices already equal.", PrintTo.OutputTab1); } catch { }
                     return;
-                }
 
                 bool acquired = false;
                 try
@@ -652,9 +619,8 @@ namespace NinjaTrader.NinjaScript.AddOns.PairedStops
         {
             lock (_sync)
             {
-                if (_state != null)             { _view.SetStatus("Pair already active — cancel first.",        isError: true); return; }
-                if (_pendingPair != null)       { _view.SetStatus("Preview already pending — confirm or cancel.", isError: true); return; }
-                if (_subscribedAccount == null) { _view.SetStatus("No account selected.",                         isError: true); return; }
+                if (_state != null)             { _view.SetStatus("Pair already active — cancel first.", isError: true); return; }
+                if (_subscribedAccount == null) { _view.SetStatus("No account selected.",                 isError: true); return; }
 
                 var instrumentName = _view.InstrumentBox.Text.Trim();
                 var instrument     = Instrument.GetInstrument(instrumentName);
@@ -698,62 +664,8 @@ namespace NinjaTrader.NinjaScript.AddOns.PairedStops
                     return;
                 }
 
-                if (_settings.GhostPreviewEnabled)
-                {
-                    _pendingPair = new PendingPair
-                    {
-                        Instrument = instrument,
-                        Quantity   = qty,
-                        BuyPx      = buyPx,
-                        SellPx     = sellPx
-                    };
-                    ShowPreviewStrip(buyPx, sellPx);
-                    return;
-                }
-
                 SubmitPair(instrument, qty, buyPx, sellPx);
             }
-        }
-
-        // -------------------------------------------------------------------
-        // Ghost preview — inline panel confirmation strip
-        // -------------------------------------------------------------------
-        private void ShowPreviewStrip(double buyPx, double sellPx)
-        {
-            _view.Dispatcher.BeginInvoke(new Action(() =>
-            {
-                _view.PreviewText.Text = $"Place buy stop @ {buyPx}, sell stop @ {sellPx} — ";
-                _view.PreviewStrip.Visibility = Visibility.Visible;
-            }));
-        }
-
-        private void HidePreviewStrip()
-        {
-            _view.Dispatcher.BeginInvoke(new Action(() =>
-            {
-                _view.PreviewStrip.Visibility = Visibility.Collapsed;
-                _view.PreviewText.Text        = "";
-            }));
-        }
-
-        private void OnPreviewConfirm()
-        {
-            PendingPair pending;
-            lock (_sync)
-            {
-                pending      = _pendingPair;
-                _pendingPair = null;
-            }
-            HidePreviewStrip();
-            if (pending == null) return;
-            lock (_sync) { SubmitPair(pending.Instrument, pending.Quantity, pending.BuyPx, pending.SellPx); }
-        }
-
-        private void OnPreviewCancel()
-        {
-            lock (_sync) { _pendingPair = null; }
-            HidePreviewStrip();
-            _view.SetStatus("Preview cancelled.");
         }
 
         private void SubmitPair(Instrument instrument, int qty, double buyPx, double sellPx)
@@ -945,15 +857,9 @@ namespace NinjaTrader.NinjaScript.AddOns.PairedStops
         public TextBox  OffsetBox      { get; }
         public TextBox  QuantityBox    { get; }
         public TextBox  AtmTemplateBox { get; }
-        public CheckBox GhostToggle    { get; }
 
         public Button PlaceButton  { get; }
         public Button CancelButton { get; }
-
-        public StackPanel PreviewStrip         { get; }
-        public TextBlock  PreviewText          { get; }
-        public Button     PreviewConfirmButton { get; }
-        public Button     PreviewCancelButton  { get; }
 
         public TextBlock StatusText { get; }
 
@@ -962,9 +868,8 @@ namespace NinjaTrader.NinjaScript.AddOns.PairedStops
             Settings    = settings;
             DataContext = settings;
 
-            // Root grid — 5 rows: inputs, buttons, preview strip, spacer, status.
+            // Root grid — 4 rows: inputs, buttons, spacer, status.
             var root = new Grid { Margin = new Thickness(12) };
-            root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
             root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
             root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
             root.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
@@ -974,16 +879,15 @@ namespace NinjaTrader.NinjaScript.AddOns.PairedStops
             var inputs = new Grid();
             inputs.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
             inputs.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(220) });
-            for (int i = 0; i < 6; i++)
+            for (int i = 0; i < 5; i++)
                 inputs.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
 
             int row = 0;
-            AccountCombo   = AddRow(inputs, ref row, "Account",           new ComboBox { Foreground = TextBrush });
-            InstrumentBox  = AddRow(inputs, ref row, "Instrument",        new TextBox  { Text = settings.InstrumentName, Foreground = TextBrush });
-            OffsetBox      = AddRow(inputs, ref row, "Offset (pts)",      new TextBox  { Text = settings.OffsetPoints.ToString("0.##", System.Globalization.CultureInfo.InvariantCulture), Foreground = TextBrush });
-            QuantityBox    = AddRow(inputs, ref row, "Quantity",          new TextBox  { Text = settings.Quantity.ToString(System.Globalization.CultureInfo.InvariantCulture), Foreground = TextBrush });
-            AtmTemplateBox = AddRow(inputs, ref row, "ATM template",      new TextBox  { Text = settings.AtmTemplate, Foreground = TextBrush });
-            GhostToggle    = AddRow(inputs, ref row, "Ghost preview",     new CheckBox { IsChecked = settings.GhostPreviewEnabled, Foreground = TextBrush });
+            AccountCombo   = AddRow(inputs, ref row, "Account",      new ComboBox { Foreground = TextBrush });
+            InstrumentBox  = AddRow(inputs, ref row, "Instrument",   new TextBox  { Text = settings.InstrumentName, Foreground = TextBrush });
+            OffsetBox      = AddRow(inputs, ref row, "Offset (pts)", new TextBox  { Text = settings.OffsetPoints.ToString("0.##", System.Globalization.CultureInfo.InvariantCulture), Foreground = TextBrush });
+            QuantityBox    = AddRow(inputs, ref row, "Quantity",     new TextBox  { Text = settings.Quantity.ToString(System.Globalization.CultureInfo.InvariantCulture), Foreground = TextBrush });
+            AtmTemplateBox = AddRow(inputs, ref row, "ATM template", new TextBox  { Text = settings.AtmTemplate, Foreground = TextBrush });
 
             Grid.SetRow(inputs, 0);
             root.Children.Add(inputs);
@@ -997,22 +901,6 @@ namespace NinjaTrader.NinjaScript.AddOns.PairedStops
             Grid.SetRow(buttons, 1);
             root.Children.Add(buttons);
 
-            // --- Preview strip (hidden until ghost preview is triggered) ---
-            PreviewStrip = new StackPanel
-            {
-                Orientation = Orientation.Horizontal,
-                Margin      = new Thickness(0, 12, 0, 0),
-                Visibility  = Visibility.Collapsed
-            };
-            PreviewText          = new TextBlock { VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(0, 0, 12, 0), Foreground = TextBrush };
-            PreviewConfirmButton = new Button { Content = "Confirm", Padding = new Thickness(8, 4, 8, 4), Margin = new Thickness(0, 0, 4, 0) };
-            PreviewCancelButton  = new Button { Content = "Cancel",  Padding = new Thickness(8, 4, 8, 4) };
-            PreviewStrip.Children.Add(PreviewText);
-            PreviewStrip.Children.Add(PreviewConfirmButton);
-            PreviewStrip.Children.Add(PreviewCancelButton);
-            Grid.SetRow(PreviewStrip, 2);
-            root.Children.Add(PreviewStrip);
-
             // --- Status ---
             StatusText = new TextBlock
             {
@@ -1020,7 +908,7 @@ namespace NinjaTrader.NinjaScript.AddOns.PairedStops
                 TextWrapping = TextWrapping.Wrap,
                 Foreground   = TextBrush
             };
-            Grid.SetRow(StatusText, 4);
+            Grid.SetRow(StatusText, 3);
             root.Children.Add(StatusText);
 
             Content = root;
@@ -1092,8 +980,6 @@ namespace NinjaTrader.NinjaScript.AddOns.PairedStops
                 Settings.AtmTemplate = AtmTemplateBox.Text.Trim();
                 SettingsStore.Save(Settings);
             };
-            GhostToggle.Checked   += (s, e) => { Settings.GhostPreviewEnabled = true;  SettingsStore.Save(Settings); };
-            GhostToggle.Unchecked += (s, e) => { Settings.GhostPreviewEnabled = false; SettingsStore.Save(Settings); };
         }
 
         private static T AddRow<T>(Grid grid, ref int row, string label, T control) where T : FrameworkElement
