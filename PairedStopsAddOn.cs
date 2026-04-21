@@ -389,8 +389,121 @@ namespace NinjaTrader.NinjaScript.AddOns.PairedStops
             // Task 9+ fills this in.
         }
 
-        // Stubs — replaced in Tasks 7 and 8.
-        private void OnPlaceClicked()  => _view.SetStatus("Place: stub — implemented in Task 7.");
+        // -------------------------------------------------------------------
+        // Place
+        // -------------------------------------------------------------------
+        private void OnPlaceClicked()
+        {
+            lock (_sync)
+            {
+                if (_state != null)                 { _view.SetStatus("Pair already active — cancel first.", isError: true); return; }
+                if (_subscribedAccount == null)     { _view.SetStatus("No account selected.",                 isError: true); return; }
+
+                var instrumentName = _view.InstrumentBox.Text.Trim();
+                var instrument     = Instrument.GetInstrument(instrumentName);
+                if (instrument == null || instrument.MasterInstrument == null)
+                {
+                    _view.SetStatus($"Instrument '{instrumentName}' not found.", isError: true);
+                    return;
+                }
+
+                if (!double.TryParse(_view.OffsetBox.Text, System.Globalization.NumberStyles.Float,
+                                     System.Globalization.CultureInfo.InvariantCulture, out var offset) || offset <= 0)
+                {
+                    _view.SetStatus("Invalid offset.", isError: true);
+                    return;
+                }
+
+                if (!int.TryParse(_view.QuantityBox.Text, out var qty) || qty <= 0)
+                {
+                    _view.SetStatus("Invalid quantity.", isError: true);
+                    return;
+                }
+
+                var tickSize = instrument.MasterInstrument.TickSize;
+                var last     = instrument.MarketData?.Last?.Price ?? 0.0;
+                if (last <= 0)
+                {
+                    var bid = instrument.MarketData?.Bid?.Price ?? 0.0;
+                    var ask = instrument.MarketData?.Ask?.Price ?? 0.0;
+                    if (bid > 0 && ask > 0) last = (bid + ask) * 0.5;
+                    else
+                    {
+                        _view.SetStatus("No market data — cannot compute prices.", isError: true);
+                        return;
+                    }
+                }
+
+                PriceMath.ComputePair(last, offset, tickSize, out var buyPx, out var sellPx);
+                if (buyPx <= sellPx)
+                {
+                    _view.SetStatus($"Invalid prices: buy {buyPx} <= sell {sellPx}.", isError: true);
+                    return;
+                }
+
+                SubmitPair(instrument, qty, buyPx, sellPx);
+            }
+        }
+
+        private void SubmitPair(Instrument instrument, int qty, double buyPx, double sellPx)
+        {
+            var pairId = Guid.NewGuid();
+            var tag    = _settings.PairTagPrefix + pairId.ToString("N").Substring(0, 8);
+
+            Order buyOrder = null, sellOrder = null;
+            try
+            {
+                buyOrder = _subscribedAccount.CreateOrder(
+                    instrument,
+                    OrderAction.Buy,
+                    OrderType.StopMarket,
+                    OrderEntry.Manual,
+                    TimeInForce.Day,
+                    qty,
+                    /* limitPrice */ 0,
+                    /* stopPrice  */ buyPx,
+                    /* oco        */ string.Empty,
+                    /* name       */ tag + "_BUY",
+                    /* gtd        */ Core.Globals.MaxDate,
+                    /* customOrder*/ null);
+                _subscribedAccount.Submit(new[] { buyOrder });
+
+                sellOrder = _subscribedAccount.CreateOrder(
+                    instrument,
+                    OrderAction.SellShort,
+                    OrderType.StopMarket,
+                    OrderEntry.Manual,
+                    TimeInForce.Day,
+                    qty,
+                    0,
+                    sellPx,
+                    string.Empty,
+                    tag + "_SELL",
+                    Core.Globals.MaxDate,
+                    null);
+                _subscribedAccount.Submit(new[] { sellOrder });
+            }
+            catch (Exception ex)
+            {
+                // Roll back the first leg if it made it through.
+                if (buyOrder != null &&
+                    (buyOrder.OrderState == OrderState.Accepted || buyOrder.OrderState == OrderState.Working))
+                {
+                    try { _subscribedAccount.Cancel(new[] { buyOrder }); }
+                    catch { /* swallow cleanup errors — nothing we can do */ }
+                }
+                _view.SetStatus($"Place failed: {ex.Message}", isError: true);
+                Output.Process($"[PairedStops] Place failed: {ex}", PrintTo.OutputTab1);
+                return;
+            }
+
+            _state = new PairState(pairId, buyOrder, sellOrder, buyPx - sellPx);
+            _view.SetStatus($"Pair active: buy @ {buyPx}, sell @ {sellPx}.");
+        }
+
+        // -------------------------------------------------------------------
+        // Cancel — replaced in Task 8
+        // -------------------------------------------------------------------
         private void OnCancelClicked() => _view.SetStatus("Cancel: stub — implemented in Task 8.");
 
         public void Dispose()
