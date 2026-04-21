@@ -600,8 +600,13 @@ namespace NinjaTrader.NinjaScript.AddOns.PairedStops
                 snapshot = _state;
             }
 
-            // Drag-sync: a Working update whose price has drifted from the expected spread.
-            if (e.Order.OrderState == OrderState.Working)
+            // Drag-sync: a live-order update whose price has drifted from the expected spread.
+            // Some brokers report stops as Working, others as Accepted. ChangeSubmitted
+            // carries the new price during a chart drag. Any of these is valid to sync on;
+            // the PricesEqual short-circuit below prevents double-firing.
+            if (e.Order.OrderState == OrderState.Working ||
+                e.Order.OrderState == OrderState.Accepted ||
+                e.Order.OrderState == OrderState.ChangeSubmitted)
             {
                 double tickSize = e.Order.Instrument.MasterInstrument.TickSize;
                 Order  partner  = snapshot.PartnerOf(e.Order);
@@ -951,6 +956,8 @@ namespace NinjaTrader.NinjaScript.AddOns.PairedStops
     // -------------------------------------------------------------------------
     public class PairedStopsView : UserControl
     {
+        private static readonly System.Windows.Media.Brush TextBrush = System.Windows.Media.Brushes.WhiteSmoke;
+
         public PairedStopsSettings Settings { get; }
 
         public ComboBox AccountCombo  { get; }
@@ -991,12 +998,12 @@ namespace NinjaTrader.NinjaScript.AddOns.PairedStops
                 inputs.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
 
             int row = 0;
-            AccountCombo  = AddRow(inputs, ref row, "Account",           new ComboBox());
-            InstrumentBox = AddRow(inputs, ref row, "Instrument",        new TextBox { Text = settings.InstrumentName });
-            OffsetBox     = AddRow(inputs, ref row, "Offset (pts)",      new TextBox { Text = settings.OffsetPoints.ToString("0.##", System.Globalization.CultureInfo.InvariantCulture) });
-            QuantityBox   = AddRow(inputs, ref row, "Quantity",          new TextBox { Text = settings.Quantity.ToString(System.Globalization.CultureInfo.InvariantCulture) });
-            GhostToggle   = AddRow(inputs, ref row, "Ghost preview",     new CheckBox { IsChecked = settings.GhostPreviewEnabled });
-            AudibleToggle = AddRow(inputs, ref row, "Beep on drag-sync", new CheckBox { IsChecked = settings.AudibleDragSync });
+            AccountCombo  = AddRow(inputs, ref row, "Account",           new ComboBox { Foreground = TextBrush });
+            InstrumentBox = AddRow(inputs, ref row, "Instrument",        new TextBox  { Text = settings.InstrumentName, Foreground = TextBrush });
+            OffsetBox     = AddRow(inputs, ref row, "Offset (pts)",      new TextBox  { Text = settings.OffsetPoints.ToString("0.##", System.Globalization.CultureInfo.InvariantCulture), Foreground = TextBrush });
+            QuantityBox   = AddRow(inputs, ref row, "Quantity",          new TextBox  { Text = settings.Quantity.ToString(System.Globalization.CultureInfo.InvariantCulture), Foreground = TextBrush });
+            GhostToggle   = AddRow(inputs, ref row, "Ghost preview",     new CheckBox { IsChecked = settings.GhostPreviewEnabled, Foreground = TextBrush });
+            AudibleToggle = AddRow(inputs, ref row, "Beep on drag-sync", new CheckBox { IsChecked = settings.AudibleDragSync,     Foreground = TextBrush });
 
             Grid.SetRow(inputs, 0);
             root.Children.Add(inputs);
@@ -1017,7 +1024,7 @@ namespace NinjaTrader.NinjaScript.AddOns.PairedStops
                 Margin      = new Thickness(0, 12, 0, 0),
                 Visibility  = Visibility.Collapsed
             };
-            PreviewText          = new TextBlock { VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(0, 0, 12, 0) };
+            PreviewText          = new TextBlock { VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(0, 0, 12, 0), Foreground = TextBrush };
             PreviewConfirmButton = new Button { Content = "Confirm", Padding = new Thickness(8, 4, 8, 4), Margin = new Thickness(0, 0, 4, 0) };
             PreviewCancelButton  = new Button { Content = "Cancel",  Padding = new Thickness(8, 4, 8, 4) };
             PreviewStrip.Children.Add(PreviewText);
@@ -1031,7 +1038,7 @@ namespace NinjaTrader.NinjaScript.AddOns.PairedStops
             {
                 Margin       = new Thickness(0, 12, 0, 0),
                 TextWrapping = TextWrapping.Wrap,
-                Foreground   = System.Windows.Media.Brushes.DimGray
+                Foreground   = TextBrush
             };
             Grid.SetRow(StatusText, 4);
             root.Children.Add(StatusText);
@@ -1048,8 +1055,8 @@ namespace NinjaTrader.NinjaScript.AddOns.PairedStops
             {
                 StatusText.Text       = message;
                 StatusText.Foreground = isError
-                    ? System.Windows.Media.Brushes.Red
-                    : System.Windows.Media.Brushes.DimGray;
+                    ? (System.Windows.Media.Brush)System.Windows.Media.Brushes.Salmon
+                    : TextBrush;
             }));
         }
 
@@ -1112,7 +1119,8 @@ namespace NinjaTrader.NinjaScript.AddOns.PairedStops
             {
                 Text              = label,
                 Margin            = new Thickness(0, 4, 12, 4),
-                VerticalAlignment = VerticalAlignment.Center
+                VerticalAlignment = VerticalAlignment.Center,
+                Foreground        = TextBrush
             };
             Grid.SetRow(lbl,     row); Grid.SetColumn(lbl,     0);
             Grid.SetRow(control, row); Grid.SetColumn(control, 1);
