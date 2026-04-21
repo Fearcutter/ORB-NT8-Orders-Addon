@@ -40,7 +40,7 @@ namespace NinjaTrader.NinjaScript.AddOns.PairedStops
 
         public string AccountName    { get; set; } = "";           // empty = auto-pick first
         public string InstrumentName { get; set; } = "NQ 06-26";   // user overrides per session
-        public string AtmTemplate    { get; set; } = "IMBA";       // NT8 ATM template name
+        public string AtmTemplate    { get; set; } = "IMBA";       // shown in fill-reminder message
 
         public bool GhostPreviewEnabled { get; set; } = false;
 
@@ -466,48 +466,23 @@ namespace NinjaTrader.NinjaScript.AddOns.PairedStops
     // -------------------------------------------------------------------------
     internal sealed class PairState
     {
-        public Guid       PairId         { get; }
-        public Instrument Instrument     { get; }
-        public string     BuyOrderId     { get; }   // the Name we passed to AtmStrategyCreate
-        public string     SellOrderId    { get; }
-        public string     BuyAtmId       { get; }   // atmStrategyId for the buy leg
-        public string     SellAtmId      { get; }   // atmStrategyId for the sell leg
-        public double     ExpectedSpread { get; }   // buyPx - sellPx at placement
-        public DateTime   CreatedUtc     { get; }
+        public Guid     PairId         { get; }
+        public Order    Buy            { get; }
+        public Order    Sell           { get; }
+        public double   ExpectedSpread { get; }   // buyPx - sellPx at placement
+        public DateTime CreatedUtc     { get; }
 
-        // Populated lazily when OrderUpdate first fires for each leg. Needed because
-        // drag-sync needs the partner's current StopPrice to short-circuit.
-        public Order Buy;
-        public Order Sell;
-
-        public PairState(Guid pairId, Instrument instrument,
-                         string buyOrderId, string sellOrderId,
-                         string buyAtmId,  string sellAtmId,
-                         double expectedSpread)
+        public PairState(Guid pairId, Order buy, Order sell, double expectedSpread)
         {
             PairId         = pairId;
-            Instrument     = instrument;
-            BuyOrderId     = buyOrderId;
-            SellOrderId    = sellOrderId;
-            BuyAtmId       = buyAtmId;
-            SellAtmId      = sellAtmId;
+            Buy            = buy;
+            Sell           = sell;
             ExpectedSpread = expectedSpread;
             CreatedUtc     = DateTime.UtcNow;
         }
 
-        public bool IsBuy  (Order o) => o != null && o.Name == BuyOrderId;
-        public bool IsSell (Order o) => o != null && o.Name == SellOrderId;
-        public bool Contains(Order o) => IsBuy(o) || IsSell(o);
-        public Order PartnerOf(Order o) => IsBuy(o) ? Sell : IsSell(o) ? Buy : null;
-        public string AtmIdFor(Order o)      => IsBuy(o) ? BuyAtmId  : IsSell(o) ? SellAtmId : null;
-        public string PartnerAtmIdOf(Order o) => IsBuy(o) ? SellAtmId : IsSell(o) ? BuyAtmId : null;
-
-        /// <summary>Caches the Order reference on first sighting so subsequent events can find the partner's StopPrice.</summary>
-        public void Observe(Order o)
-        {
-            if (IsBuy(o))  Buy  = o;
-            if (IsSell(o)) Sell = o;
-        }
+        public Order PartnerOf(Order o) => o == Buy ? Sell : (o == Sell ? Buy : null);
+        public bool  Contains (Order o) => o == Buy || o == Sell;
     }
 
     internal sealed class PairManager : IDisposable
@@ -608,7 +583,7 @@ namespace NinjaTrader.NinjaScript.AddOns.PairedStops
 
         private void OnAccountOrderUpdate(object sender, OrderEventArgs e)
         {
-            // Diagnostic: log every OrderUpdate received.
+            // Diagnostic: log every OrderUpdate received. Remove once drag-sync is verified working.
             try
             {
                 Output.Process(
@@ -623,30 +598,32 @@ namespace NinjaTrader.NinjaScript.AddOns.PairedStops
             PairState snapshot;
             lock (_sync)
             {
-                if (_programmatic) return;                          // our own programmatic update echoing back
+                if (_programmatic) return;                      // our own ChangeOrder echoing back
                 if (_state == null || !_state.Contains(e.Order)) return;
-                _state.Observe(e.Order);                            // cache Order ref for partner-price lookup
                 snapshot = _state;
             }
 
-            // Drag-sync: a live entry-order update whose price has drifted from the expected spread.
-            // Triggered on Working / Accepted / ChangeSubmitted. The PricesEqual short-circuit
-            // prevents double-firing across multiple events per drag.
+            // Drag-sync: a live-order update whose price has drifted from the expected spread.
+            // Some brokers report stops as Working, others as Accepted. ChangeSubmitted
+            // carries the new price during a chart drag. Any of these is valid to sync on;
+            // the PricesEqual short-circuit below prevents double-firing.
             if (e.Order.OrderState == OrderState.Working ||
                 e.Order.OrderState == OrderState.Accepted ||
                 e.Order.OrderState == OrderState.ChangeSubmitted)
             {
-                double tickSize = snapshot.Instrument.MasterInstrument.TickSize;
+                double tickSize = e.Order.Instrument.MasterInstrument.TickSize;
                 Order  partner  = snapshot.PartnerOf(e.Order);
-                if (partner == null) return;  // partner hasn't produced an OrderUpdate yet — sync on next event
+                if (partner == null) return;
 
-                double expectedPartnerPx = snapshot.IsBuy(e.Order)
+                double expectedPartnerPx = e.Order == snapshot.Buy
                     ? e.Order.StopPrice - snapshot.ExpectedSpread
                     : e.Order.StopPrice + snapshot.ExpectedSpread;
                 expectedPartnerPx = PriceMath.RoundToTick(expectedPartnerPx, tickSize);
 
                 try { Output.Process($"[PairedStops] Drag-sync check: moved={e.Order.Name} movedStop={e.Order.StopPrice} partnerStop={partner.StopPrice} expected={expectedPartnerPx}", PrintTo.OutputTab1); } catch { }
 
+                // Second line of defense against the threaded echo: if the partner is
+                // already at the expected price, there's nothing to sync.
                 if (PriceMath.PricesEqual(partner.StopPrice, expectedPartnerPx, tickSize))
                 {
                     try { Output.Process("[PairedStops] Drag-sync short-circuit: prices already equal.", PrintTo.OutputTab1); } catch { }
@@ -658,17 +635,50 @@ namespace NinjaTrader.NinjaScript.AddOns.PairedStops
                 {
                     lock (_sync) { _programmatic = true; acquired = true; }
 
-                    // ATM-aware entry-order change. This moves the partner leg's entry
-                    // stop price without cancel-and-recreate: the ATM stays attached.
-                    string partnerAtmId = snapshot.PartnerAtmIdOf(e.Order);
-                    NinjaTrader.NinjaScript.AtmStrategy.AtmStrategyChangeEntryOrder(
-                        /* limitPrice */ 0,
-                        /* stopPrice  */ expectedPartnerPx,
-                        partnerAtmId);
+                    // Cancel-and-recreate: the safest way to move an unmanaged stop
+                    // in NT8. We hold _programmatic = true across the whole sequence
+                    // so the cancel echo, the new-order Accepted event, and the new
+                    // Working event all get suppressed in our handler.
+                    var instrument      = partner.Instrument;
+                    var qty             = partner.Quantity;
+                    var movedIsBuy      = e.Order == snapshot.Buy;
+                    var partnerIsBuy    = !movedIsBuy;
+                    var partnerAction   = partnerIsBuy ? OrderAction.Buy : OrderAction.SellShort;
+                    var partnerName     = partner.Name; // preserve the PAIRSTOP_<guid>_{BUY|SELL} tag
+
+                    _subscribedAccount.Cancel(new[] { partner });
+
+                    var newPartner = _subscribedAccount.CreateOrder(
+                        instrument,
+                        partnerAction,
+                        OrderType.StopMarket,
+                        OrderEntry.Manual,
+                        TimeInForce.Day,
+                        qty,
+                        0,
+                        expectedPartnerPx,
+                        string.Empty,
+                        partnerName,
+                        Core.Globals.MaxDate,
+                        null);
+                    _subscribedAccount.Submit(new[] { newPartner });
+
+                    // Swap the partner reference in tracking state so subsequent
+                    // events on the old partner are ignored and new events on the
+                    // new partner are recognized.
+                    lock (_sync)
+                    {
+                        if (_state == snapshot)
+                        {
+                            _state = movedIsBuy
+                                ? new PairState(snapshot.PairId, snapshot.Buy, newPartner, snapshot.ExpectedSpread)
+                                : new PairState(snapshot.PairId, newPartner, snapshot.Sell, snapshot.ExpectedSpread);
+                        }
+                    }
 
                     if (_settings.AudibleDragSync)
                     {
-                        try { System.Media.SystemSounds.Asterisk.Play(); } catch { /* no audio device */ }
+                        try { System.Media.SystemSounds.Asterisk.Play(); } catch { /* no audio device — ignore */ }
                     }
                     _view.SetStatus($"Synced partner to {expectedPartnerPx}.");
                 }
@@ -686,23 +696,43 @@ namespace NinjaTrader.NinjaScript.AddOns.PairedStops
                 return;
             }
 
-            // OCO on fill. When one leg fills, its ATM auto-activates its TP/SL (that's the
-            // whole point of the ATM refactor). We just cancel the OTHER leg's pending entry.
+            // OCO on fill.
             if (e.Order.OrderState == OrderState.Filled)
             {
-                string partnerAtmId = snapshot.PartnerAtmIdOf(e.Order);
-                TryCancelAtm(partnerAtmId, snapshot.IsBuy(e.Order) ? "sell" : "buy");
+                var partner = snapshot.PartnerOf(e.Order);
+                if (partner != null &&
+                    (partner.OrderState == OrderState.Working || partner.OrderState == OrderState.Accepted))
+                {
+                    try { _subscribedAccount.Cancel(new[] { partner }); }
+                    catch (Exception ex)
+                    {
+                        Output.Process($"[PairedStops] OCO cancel failed: {ex}", PrintTo.OutputTab1);
+                    }
+                }
                 lock (_sync) { if (_state == snapshot) _state = null; }
-                var side = snapshot.IsBuy(e.Order) ? "Buy" : "Sell";
-                _view.SetStatus($"{side} stop filled — partner entry cancelled, ATM active on fill.");
+                var side = e.Order == snapshot.Buy ? "Buy" : "Sell";
+                var atm  = (_settings.AtmTemplate ?? "").Trim();
+                var note = string.IsNullOrEmpty(atm)
+                    ? "engage your ATM manually in Chart Trader."
+                    : $"engage ATM template '{atm}' manually in Chart Trader.";
+                _view.SetStatus($"{side} stop filled — partner cancelled. Now {note}", isError: true);
                 return;
             }
 
-            // Manual cancel or exchange rejection on one leg — cancel the partner and clear state.
+            // Manual cancel (via Chart Trader) or exchange rejection on one leg —
+            // cancel the partner and clear state so the pair stays all-or-nothing.
             if (e.Order.OrderState == OrderState.Cancelled || e.Order.OrderState == OrderState.Rejected)
             {
-                string partnerAtmId = snapshot.PartnerAtmIdOf(e.Order);
-                TryCancelAtm(partnerAtmId, snapshot.IsBuy(e.Order) ? "sell" : "buy");
+                var partner = snapshot.PartnerOf(e.Order);
+                if (partner != null &&
+                    (partner.OrderState == OrderState.Working || partner.OrderState == OrderState.Accepted))
+                {
+                    try { _subscribedAccount.Cancel(new[] { partner }); }
+                    catch (Exception ex)
+                    {
+                        Output.Process($"[PairedStops] Partner cancel after cancel/reject failed: {ex}", PrintTo.OutputTab1);
+                    }
+                }
                 lock (_sync) { if (_state == snapshot) _state = null; }
 
                 bool isReject = e.Order.OrderState == OrderState.Rejected;
@@ -829,86 +859,58 @@ namespace NinjaTrader.NinjaScript.AddOns.PairedStops
 
         private void SubmitPair(Instrument instrument, int qty, double buyPx, double sellPx)
         {
-            var template = (_settings.AtmTemplate ?? "").Trim();
-            if (string.IsNullOrEmpty(template))
-            {
-                _view.SetStatus("ATM template is empty — set it in the form before placing.", isError: true);
-                return;
-            }
+            var pairId = Guid.NewGuid();
+            var tag    = _settings.PairTagPrefix + pairId.ToString("N").Substring(0, 8);
 
-            var pairId      = Guid.NewGuid();
-            var tag         = _settings.PairTagPrefix + pairId.ToString("N").Substring(0, 8);
-            var buyOrderId  = tag + "_BUY";
-            var sellOrderId = tag + "_SELL";
-            var buyAtmId    = NinjaTrader.NinjaScript.AtmStrategy.GetAtmStrategyUniqueId();
-            var sellAtmId   = NinjaTrader.NinjaScript.AtmStrategy.GetAtmStrategyUniqueId();
-
-            // Create pair state BEFORE submitting so the OrderUpdate echo can attribute
-            // events to us (by name match). Otherwise we'd race the state init.
-            _state = new PairState(pairId, instrument, buyOrderId, sellOrderId,
-                                   buyAtmId, sellAtmId, buyPx - sellPx);
-
-            bool buyOk  = false, sellOk = false;
+            Order buyOrder = null, sellOrder = null;
             try
             {
-                // Buy leg
-                NinjaTrader.NinjaScript.AtmStrategy.AtmStrategyCreate(
+                buyOrder = _subscribedAccount.CreateOrder(
+                    instrument,
                     OrderAction.Buy,
                     OrderType.StopMarket,
-                    /* limit */ 0,
-                    /* stop  */ buyPx,
+                    OrderEntry.Manual,
                     TimeInForce.Day,
-                    buyOrderId,
-                    template,
-                    buyAtmId,
-                    (errorCode, orderIdResult) =>
-                    {
-                        if (errorCode != ErrorCode.NoError)
-                        {
-                            Output.Process($"[PairedStops] Buy ATM create failed: {errorCode}", PrintTo.OutputTab1);
-                            _view.SetStatus($"Buy ATM submit failed: {errorCode}", isError: true);
-                        }
-                    });
-                buyOk = true;
+                    qty,
+                    /* limitPrice */ 0,
+                    /* stopPrice  */ buyPx,
+                    /* oco        */ string.Empty,
+                    /* name       */ tag + "_BUY",
+                    /* gtd        */ Core.Globals.MaxDate,
+                    /* customOrder*/ null);
+                _subscribedAccount.Submit(new[] { buyOrder });
 
-                // Sell leg
-                NinjaTrader.NinjaScript.AtmStrategy.AtmStrategyCreate(
+                sellOrder = _subscribedAccount.CreateOrder(
+                    instrument,
                     OrderAction.SellShort,
                     OrderType.StopMarket,
+                    OrderEntry.Manual,
+                    TimeInForce.Day,
+                    qty,
                     0,
                     sellPx,
-                    TimeInForce.Day,
-                    sellOrderId,
-                    template,
-                    sellAtmId,
-                    (errorCode, orderIdResult) =>
-                    {
-                        if (errorCode != ErrorCode.NoError)
-                        {
-                            Output.Process($"[PairedStops] Sell ATM create failed: {errorCode}", PrintTo.OutputTab1);
-                            _view.SetStatus($"Sell ATM submit failed: {errorCode}", isError: true);
-                            // Roll back the buy leg if the sell failed.
-                            try { NinjaTrader.NinjaScript.AtmStrategy.AtmStrategyCancelEntryOrder(buyAtmId); }
-                            catch (Exception innerEx) { Output.Process($"[PairedStops] Rollback cancel failed: {innerEx}", PrintTo.OutputTab1); }
-                            lock (_sync) { _state = null; }
-                        }
-                    });
-                sellOk = true;
+                    string.Empty,
+                    tag + "_SELL",
+                    Core.Globals.MaxDate,
+                    null);
+                _subscribedAccount.Submit(new[] { sellOrder });
             }
             catch (Exception ex)
             {
-                if (buyOk)
+                // Roll back the first leg if it made it through.
+                if (buyOrder != null &&
+                    (buyOrder.OrderState == OrderState.Accepted || buyOrder.OrderState == OrderState.Working))
                 {
-                    try { NinjaTrader.NinjaScript.AtmStrategy.AtmStrategyCancelEntryOrder(buyAtmId); }
-                    catch { /* swallow */ }
+                    try { _subscribedAccount.Cancel(new[] { buyOrder }); }
+                    catch { /* swallow cleanup errors — nothing we can do */ }
                 }
-                _state = null;
                 _view.SetStatus($"Place failed: {ex.Message}", isError: true);
                 Output.Process($"[PairedStops] Place failed: {ex}", PrintTo.OutputTab1);
                 return;
             }
 
-            _view.SetStatus($"Pair active (ATM={template}): buy @ {buyPx}, sell @ {sellPx}.");
+            _state = new PairState(pairId, buyOrder, sellOrder, buyPx - sellPx);
+            _view.SetStatus($"Pair active: buy @ {buyPx}, sell @ {sellPx}.");
         }
 
         // -------------------------------------------------------------------
@@ -916,7 +918,6 @@ namespace NinjaTrader.NinjaScript.AddOns.PairedStops
         // -------------------------------------------------------------------
         private void OnCancelClicked()
         {
-            string buyAtm, sellAtm;
             lock (_sync)
             {
                 if (_state == null)
@@ -924,23 +925,23 @@ namespace NinjaTrader.NinjaScript.AddOns.PairedStops
                     _view.SetStatus("No active pair to cancel.");
                     return;
                 }
-                buyAtm  = _state.BuyAtmId;
-                sellAtm = _state.SellAtmId;
-                _state  = null;
-            }
 
-            TryCancelAtm(buyAtm,  "buy");
-            TryCancelAtm(sellAtm, "sell");
-            _view.SetStatus("Pair cancelled.");
-        }
+                var toCancel = new List<Order>();
+                if (_state.Buy.OrderState  == OrderState.Working || _state.Buy.OrderState  == OrderState.Accepted) toCancel.Add(_state.Buy);
+                if (_state.Sell.OrderState == OrderState.Working || _state.Sell.OrderState == OrderState.Accepted) toCancel.Add(_state.Sell);
 
-        private static void TryCancelAtm(string atmStrategyId, string legName)
-        {
-            if (string.IsNullOrEmpty(atmStrategyId)) return;
-            try { NinjaTrader.NinjaScript.AtmStrategy.AtmStrategyCancelEntryOrder(atmStrategyId); }
-            catch (Exception ex)
-            {
-                Output.Process($"[PairedStops] Cancel {legName} ATM failed: {ex}", PrintTo.OutputTab1);
+                if (toCancel.Count > 0)
+                {
+                    try { _subscribedAccount.Cancel(toCancel.ToArray()); }
+                    catch (Exception ex)
+                    {
+                        _view.SetStatus($"Cancel failed: {ex.Message}", isError: true);
+                        Output.Process($"[PairedStops] Cancel failed: {ex}", PrintTo.OutputTab1);
+                    }
+                }
+
+                _state = null;
+                _view.SetStatus("Pair cancelled.");
             }
         }
 
@@ -966,13 +967,13 @@ namespace NinjaTrader.NinjaScript.AddOns.PairedStops
 
         public PairedStopsSettings Settings { get; }
 
-        public ComboBox AccountCombo  { get; }
-        public TextBox  InstrumentBox { get; }
-        public TextBox  OffsetBox     { get; }
-        public TextBox  QuantityBox   { get; }
+        public ComboBox AccountCombo   { get; }
+        public TextBox  InstrumentBox  { get; }
+        public TextBox  OffsetBox      { get; }
+        public TextBox  QuantityBox    { get; }
         public TextBox  AtmTemplateBox { get; }
-        public CheckBox GhostToggle   { get; }
-        public CheckBox AudibleToggle { get; }
+        public CheckBox GhostToggle    { get; }
+        public CheckBox AudibleToggle  { get; }
 
         public Button PlaceButton  { get; }
         public Button CancelButton { get; }
