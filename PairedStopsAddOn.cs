@@ -411,6 +411,30 @@ namespace NinjaTrader.NinjaScript.AddOns.PairedStops
                 _view.SetStatus($"{side} stop filled — partner cancelled.");
                 return;
             }
+
+            // Manual cancel (via Chart Trader) or exchange rejection on one leg —
+            // cancel the partner and clear state so the pair stays all-or-nothing.
+            if (e.Order.OrderState == OrderState.Cancelled || e.Order.OrderState == OrderState.Rejected)
+            {
+                var partner = snapshot.PartnerOf(e.Order);
+                if (partner != null &&
+                    (partner.OrderState == OrderState.Working || partner.OrderState == OrderState.Accepted))
+                {
+                    try { _subscribedAccount.Cancel(new[] { partner }); }
+                    catch (Exception ex)
+                    {
+                        Output.Process($"[PairedStops] Partner cancel after cancel/reject failed: {ex}", PrintTo.OutputTab1);
+                    }
+                }
+                lock (_sync) { if (_state == snapshot) _state = null; }
+
+                bool isReject = e.Order.OrderState == OrderState.Rejected;
+                string msg    = isReject
+                    ? $"Order rejected: {e.Order.ErrorCode} {e.Order.NativeError}"
+                    : "One leg cancelled — partner cancelled to preserve pair integrity.";
+                _view.SetStatus(msg, isError: isReject);
+                return;
+            }
         }
 
         // -------------------------------------------------------------------
